@@ -363,6 +363,12 @@ func (b *Broker) validateSettingsPortsLocked(ctx context.Context, engine string,
 		if port == current.EffectiveProxyPort || (current.Running && port == current.EffectiveServerPort) {
 			continue
 		}
+		// A user-managed engine's server port belongs to the user's own server:
+		// it is occupied exactly when that server is up — the state PAIR is
+		// meant to probe and adopt — so occupancy there is never a conflict.
+		if current.External && port == config.ServerPort {
+			continue
+		}
 		if !tcpPortAvailable(port) {
 			return fmt.Errorf("port %d is already in use", port)
 		}

@@ -204,3 +204,47 @@ func TestUserManagedEngineSettingsArePortOnly(t *testing.T) {
 		t.Fatalf("apply disturbed the shared facade port: %d", applied.Settings.ProxyPort)
 	}
 }
+
+// A user-managed engine's server port is occupied exactly when the user's
+// server is up — the state PAIR probes and adopts. Naming that port must
+// never read as a port conflict: pointing PAIR at a running server is the
+// whole workflow, not something to resolve first.
+func TestUserManagedEngineServerPortMayBeOccupied(t *testing.T) {
+	const facadePort = 23457
+	f := newExternalSettingsFixture(t, facadePort)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// The user's server is up and listening on the port they will name.
+	server, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	occupied := server.Addr().(*net.TCPAddr).Port
+
+	f.b.engineConfigMu.Lock()
+	snapshot, err := f.b.settingsSnapshotLocked(ctx, "openai-compatible")
+	f.b.engineConfigMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := settings.Request{Engine: "openai-compatible", ExpectedRevision: snapshot.Revision,
+		RequestID: settingsID(), Settings: snapshot.Settings}
+	request.Settings.ServerPort = occupied
+	receipt, err := f.b.applyEngineSettings(ctx, request, "")
+	if err != nil {
+		t.Fatalf("apply refused an occupied user-managed server port: %v", err)
+	}
+	if receipt.Phase != "succeeded" {
+		t.Fatalf("apply receipt = %+v", receipt)
+	}
+	select {
+	case configure := <-f.configure:
+		if configure.Settings.ServerPort != occupied {
+			t.Fatalf("configure payload port = %d, want %d", configure.Settings.ServerPort, occupied)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the apply never reached the worker")
+	}
+}

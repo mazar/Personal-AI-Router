@@ -71,7 +71,8 @@ for a swap. Revalidation happens at Apply; OS bind remains the final arbiter of
 a competing process. Adopted process engines are read-only; command-mode
 engines require their official stop path. A facade-riding engine and the facade
 it rides share one proxy port by construction, so that equality is not treated
-as a collision in either direction.
+as a collision in either direction. A user-managed engine's server port is its
+own server's listener: occupied there is the state PAIR adopts, not a conflict.
 
 A normalized no-op changes no runtime. Proxy-only edits do not restart the
 engine. A stopped engine remains stopped. Running launch/server changes stop
