@@ -20,7 +20,7 @@ flowchart TB
     NodeB["<b>Node</b>"]
     EngineA1["<b>Engine</b><br/>Ollama"]
     EngineA2["<b>Engine</b><br/>LM Studio"]
-    EngineB1["<b>Engine</b><br/>Ollama"]
+    EngineB1["<b>Engine</b><br/>Ollama<br/>+ OpenAI-compatible server"]
     ModelA1["<b>Models</b><br/>present on this engine"]
     ModelA2["<b>Models</b>"]
     ModelB1["<b>Models</b>"]
@@ -40,8 +40,9 @@ flowchart TB
   one cluster.
 - A **node** is one machine. Nodes are peers where each runs the same services, and
   each can both serve requests and route them elsewhere.
-- An **engine** is an inference server on a node, Ollama or LM Studio. A node can
-  run both, one, or neither, and a node with no running engine is not eligible to
+- An **engine** is an inference server on a node: Ollama, LM Studio, or an
+  OpenAI-compatible server you run yourself, such as vLLM. A node can run
+  several, one, or none, and a node with no running engine is not eligible to
   serve.
 - **Models** belong to an engine on a specific node. Nothing is shared. The same
   model on two nodes is two independent copies and that duplication is what makes
@@ -357,7 +358,8 @@ across the cluster as a whole.
 When an inference request contains a non-empty model, only nodes whose current
 inventory for that engine advertises the model enter the failover list. An empty
 inventory and an inventory that lists other models are both ineligible. Ollama's
-implicit `:latest` tag is normalized; LM Studio model IDs match exactly.
+implicit `:latest` tag is normalized; LM Studio model IDs and OpenAI-compatible
+server model IDs match exactly.
 
 If no advertised owner is routable, the proxy returns an actionable local `502`
 without sending the request to an engine. It does not broaden the candidate list
@@ -428,7 +430,7 @@ one place lower in the order.
 to an engine's own port is absent from workload events. GPU-heavy external work
 can still raise pressure, but CPU-only work and queued demand remain invisible.
 
-**Both engines are counted as one pool.** Ollama and LM Studio load is summed,
+**All of a node's engines are counted as one pool.** Engine load is summed,
 and maximum GPU pressure applies to the whole node. That is conservative on a
 typical single-GPU machine and can underuse a multi-GPU node where the engines
 occupy different devices.
@@ -477,6 +479,13 @@ instead of leaving two listeners on different ports. To get an instance PAIR can
 fully manage, stop the engine in its own application and let PAIR start it on a
 port nothing else is serving.
 
+A **user-managed engine** goes one step further. For an OpenAI-compatible server
+such as vLLM, PAIR never installs, starts, stops, or updates anything: you run
+the server in its own application, and PAIR only probes the port you configured
+(default `8000`) and reports it as running while it answers. Moving the server is
+your change to make — update the port in PAIR's settings for that engine and
+PAIR re-probes, without touching any process.
+
 ### Port Takeover
 
 An application that already works with Ollama is configured for `11434`. If PAIR
@@ -520,7 +529,7 @@ A default installation listens on these ports:
 
 | Port | Listener |
 | --- | --- |
-| `11434` | Ollama-compatible proxy (Ollama itself moves to `11435`+) |
+| `11434` | Ollama-compatible proxy (Ollama itself moves to `11435`+; an OpenAI-compatible server's models are served here too) |
 | `1234` | OpenAI-compatible proxy (LM Studio moves to `1235`+) |
 | `14318` | Node hardware and model inventory |
 | `14319` | Service-error synchronization between nodes |
@@ -532,6 +541,11 @@ A default installation listens on these ports:
 The `143xx` listeners are the peer surfaces from
 [Node-to-Node Communication](#node-to-node-communication). Their numbers are
 fixed, so the broker can tell a worker which port to serve without a handshake.
+
+One port on this table is not PAIR's at all: an OpenAI-compatible server you run
+yourself listens wherever you configured it — `8000` by convention — and PAIR
+only routes to it over loopback. It gets no proxy and no takeover; requests for
+its models enter through the `11434` endpoint above.
 
 The components that own proxy and engine ports persist them and restore them on
 the next start, so a port a user chose survives a restart. Refer to

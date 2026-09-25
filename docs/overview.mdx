@@ -38,15 +38,19 @@ These terms have specific meanings in PAIR:
   is no server, controller, or primary node.
 - **Cluster** — the set of nodes you have paired together. A node belongs to at
   most one cluster, and it must leave before it can join another.
-- **Engine** — the local inference server that runs models: Ollama or LM Studio.
-  PAIR can install, start, stop, and update an engine, or adopt one you already
-  run yourself.
+- **Engine** — the local inference server that runs models: Ollama, LM Studio,
+  or an OpenAI-compatible server such as vLLM. PAIR can install, start, stop,
+  and update an engine, adopt one you already run yourself, or — for an
+  OpenAI-compatible server — simply route to one you run and manage entirely
+  on your own.
 - **Model** — what you prepare on each node. Nodes do not share models, so a
   node can serve a request only for a model it already holds. Preparing the same
   model on several nodes is what makes those nodes interchangeable.
 - **Endpoint** — the local URL your applications use. PAIR presents one for each
   engine on the machine you are working at, and it stays the same no matter which
-  node serves the request.
+  node serves the request. An OpenAI-compatible server you run yourself has no
+  endpoint of its own: its models are served through the Ollama-compatible
+  endpoint, where the model name picks the server.
 - **Proxy** — what sits behind an endpoint. It accepts a request, picks a node,
   forwards the request, and streams the response back.
 - **Job** — one routed request, which the **Jobs** view shows. The services call
@@ -183,7 +187,8 @@ The Go tree contains 12 build outputs:
 
 - `nvpair-ui-broker`: service entry point, worker supervisor, and JSON-RPC API
 - `nvpair-proxy`: the compatible inference proxy — one process hosting a facade
-  for each enabled engine
+  for each enabled engine; an engine that rides another engine's facade shares
+  that facade instead of getting its own
 - `nvpair-node-scanner` and `nvpair-node-info`: discovery and host telemetry
 - `nvpair-manual-nodes`: user-specified nodes
 - `nvpair-engine-manager`: local engine and model lifecycle
