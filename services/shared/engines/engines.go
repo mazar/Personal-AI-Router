@@ -19,7 +19,21 @@
 //   - Name is lower-case and unpunctuated ("lmstudio", not "lm-studio"). The
 //     desktop UI uses its own hyphenated spelling for display types and bridges
 //     to this one at the process boundary; that bridge is the only place the two
-//     vocabularies are allowed to meet.
+//     vocabularies are allowed to meet. "openai-compatible" is the deliberate
+//     exception: it shipped with one spelling on both sides of the bridge, so
+//     EngineManagerNames maps it to itself and there is no second vocabulary
+//     to keep in step.
+//
+//   - A facade-less engine (SharedFacade set) rides another engine's listener
+//     instead of having its own. It still takes a full row in this table — its
+//     Name is the manifest basename, the discovery model-attribution key, the
+//     workload Engine value, and the client-facing relay prefix — but its
+//     FacadePort, EnginePortBase and PortFile are zero and meaningless, its
+//     DiscoveryService is never registered (inventory reaches peers through the
+//     engine-manager's model endpoint and dialing through the facade engine's
+//     service key), and every consumer that keys off those fields must check
+//     SharedFacade first. Port planning, facade enablement and the TUI proxies
+//     view all skip it.
 //
 //   - There are two proxy identities, and which one a caller wants depends on
 //     whether it is naming a *facade* or the *process*.
@@ -104,6 +118,16 @@ type Engine struct {
 	// broker reads it when reserving ports away from the OLLAMA_HOST alias,
 	// so the two must agree — which is why it lives here.
 	PortFile string
+
+	// SharedFacade, when non-empty, names the engine whose facade carries this
+	// engine's traffic. PAIR brings up no facade of its own for such an engine:
+	// its models are routed through the named engine's listener, decided per
+	// request by path dialect and model name. Its FacadePort, EnginePortBase
+	// and PortFile are zero, its DiscoveryService is never registered, and its
+	// ComponentName remains a valid client-facing relay prefix that the broker
+	// resolves onto the facade engine. Empty means the engine owns its facade
+	// and every other field applies.
+	SharedFacade string
 }
 
 // ProxyComponent is the proxy *process* identity, as distinct from the
@@ -142,6 +166,17 @@ var all = []Engine{
 		FacadePort:       1234,
 		EnginePortBase:   1235,
 		PortFile:         "lmstudio-proxy-port.json",
+	},
+	{
+		// A user-managed OpenAI-compatible server (vLLM, SGLang, llama.cpp's
+		// server, ...). PAIR never installs, spawns or stops it; the engine
+		// manager health-probes and adopts it, and its models ride the Ollama
+		// facade. DiscoveryService points at the facade it rides and is never
+		// registered for this engine — see SharedFacade.
+		Name:             "openai-compatible",
+		DisplayName:      "OpenAI-compatible server",
+		DiscoveryService: noderec.ServiceOllama,
+		SharedFacade:     "ollama",
 	},
 }
 
