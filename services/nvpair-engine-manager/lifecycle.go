@@ -169,6 +169,16 @@ func (e *Executor) doStart(ctx context.Context, st *engineState, engine string, 
 	if presence.Occupied && rt.modeOrDefault() == "process" {
 		return fmt.Errorf("cannot start engine %q on port %d: the port is occupied by a service that did not identify as %s", engine, port, st.manifest.DisplayName)
 	}
+	if rt.modeOrDefault() == "external" {
+		// A user-managed engine has no launch this service can perform. An
+		// identified listener was adopted above; anything else is reported, not
+		// attempted — and at restore time a not-yet-started server is expected,
+		// so no start-failed service error is raised on this path.
+		if presence.Occupied {
+			return fmt.Errorf("cannot start engine %q on port %d: the port is occupied by a service that did not identify as %s", engine, port, st.manifest.DisplayName)
+		}
+		return fmt.Errorf("engine %q is user-managed: start it in its own application on port %d (or set the port to where it listens); it is adopted once it answers", engine, port)
+	}
 	if !pathInstalled {
 		return fmt.Errorf("engine %q is not installed", engine)
 	}
@@ -778,6 +788,11 @@ func (e *Executor) StopAll() {
 			st.mu.Unlock()
 			if cancel != nil {
 				cancel()
+			}
+			if st.plat.Runtime.modeOrDefault() == "external" {
+				// A user-managed engine has no process of ours to stop; shutdown
+				// leaves the user's server alone and its intent untouched.
+				return
 			}
 			st.opMu.Lock()
 			defer st.opMu.Unlock()

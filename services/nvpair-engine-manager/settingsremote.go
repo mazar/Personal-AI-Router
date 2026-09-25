@@ -235,7 +235,9 @@ func (m *Manager) consumeSettingsStream(parent context.Context, peer ecPeer) {
 			return
 		}
 		for _, snapshot := range snapshots {
-			if snapshot.Engine != "ollama" && snapshot.Engine != "lmstudio" {
+			// Relay only engines this binary knows, so a peer's future or stale
+			// engine set cannot inject unknown settings snapshots.
+			if _, ok := m.exec.reg.Get(snapshot.Engine); !ok {
 				continue
 			}
 			snapshot.NodeID = peer.nodeID

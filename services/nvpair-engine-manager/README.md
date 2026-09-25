@@ -5,11 +5,14 @@ SPDX-License-Identifier: Apache-2.0
 
 # nvpair-engine-manager
 
-A config-driven control plane for local inference engines (Ollama today;
-Intel/others via a dropped-in manifest). It manages everything about an
+A config-driven control plane for local inference engines (Ollama and the
+user-managed OpenAI-compatible server today; Intel/others via a dropped-in
+manifest). It manages everything about an
 engine **except serving inference**: detect, user-mode install,
 start/stop/restart, health, and config-declared actions. Adding an engine
-is a JSON manifest, not code.
+is a JSON manifest, not code. An `external`-mode manifest — the
+OpenAI-compatible server — goes further and owns nothing at all: PAIR probes
+the port the user configured and routes to whatever answers there.
 
 The bundled manifests under `manifests/` are the working reference for manifest
 authoring.

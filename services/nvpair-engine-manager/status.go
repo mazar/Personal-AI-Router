@@ -124,10 +124,14 @@ func (e *Executor) Errors() []serviceError {
 func (e *Executor) snapshot(engine string, st *engineState) EngineStatus {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	// An external engine has nothing to install — report it as installed from
+	// the start, so the interface shows a user-managed server that is merely
+	// not running rather than one that is missing.
+	installed := st.installed || st.plat.Runtime.modeOrDefault() == "external"
 	return EngineStatus{
 		Engine:      engine,
 		DisplayName: st.manifest.DisplayName,
-		Installed:   st.installed,
+		Installed:   installed,
 		Running:     st.running,
 		Healthy:     st.healthy,
 		Port:        st.port,
@@ -153,8 +157,10 @@ func (e *Executor) reconcilePresence(ctx context.Context, engine string, st *eng
 
 	// A command-mode engine needs its control CLI. A compatible HTTP endpoint
 	// alone (for example another OpenAI server on LM Studio's port) is not an
-	// installation and must not suppress the installer.
-	if !pathInstalled && st.plat.Runtime.modeOrDefault() != "process" {
+	// installation and must not suppress the installer. An external engine is
+	// nothing but its HTTP endpoint, so the probe runs unconditionally —
+	// adopting it is the whole job.
+	if !pathInstalled && st.plat.Runtime.modeOrDefault() == "command" {
 		return presenceResult{}
 	}
 

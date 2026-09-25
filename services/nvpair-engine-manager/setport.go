@@ -47,6 +47,27 @@ func (e *Executor) SetPort(ctx context.Context, engine string, port int) (Engine
 	oldPort := st.port
 	st.mu.Unlock()
 
+	// An external engine is user-managed: PAIR cannot move it, but it can
+	// follow it. Persist the port and reconcile — if the server really moved,
+	// the next probe adopts it there; if not, the engine reports down until
+	// the user moves it or sets the port back. No stop/start: PAIR owns no
+	// process to bounce.
+	if st.plat.Runtime.modeOrDefault() == "external" {
+		if err := e.persistPort(engine, port); err != nil {
+			return EngineStatus{}, err
+		}
+		st.mu.Lock()
+		st.port = port
+		if st.plat != nil {
+			st.plat.Runtime.Port = port
+		}
+		st.mu.Unlock()
+		pathInstalled, _ := e.Detect(engine)
+		e.reconcilePresence(ctx, engine, st, pathInstalled, port, false)
+		e.emitState(engine)
+		return e.snapshot(engine, st), nil
+	}
+
 	// Adopted process-mode engines and command-mode engines without an official
 	// stop command remain externally managed. Refuse rather than killing an
 	// unknown process or spawning a duplicate listener on the new port.

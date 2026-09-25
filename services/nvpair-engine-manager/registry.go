@@ -112,6 +112,13 @@ type Fetch struct {
 //   - "command": the engine is a daemon brought up/down by commands
 //     (e.g. LM Studio's `lms`); liveness = the readiness/health probe,
 //     and Stop.Cmd brings it down.
+//   - "external": the engine is user-managed end to end (e.g. an
+//     OpenAI-compatible server the user runs themselves). This service
+//     never installs, spawns or stops it; Port is the port the user runs
+//     it on (required — the service does not choose it), readiness and
+//     health probes are required, and the only lifecycle operation is
+//     adoption: probe the port, and report the engine running when it
+//     identifies itself there.
 type Runtime struct {
 	EditableLaunch *EditableLaunch   `json:"editable_launch,omitempty"`
 	LaunchArgs     *[]string         `json:"launch_args,omitempty"` // literal arguments after managed fields
@@ -632,8 +639,15 @@ func (p *Platform) validate(key string) error {
 		if len(p.Runtime.Start) == 0 {
 			return fmt.Errorf("platform %q: runtime.start is required in command mode", key)
 		}
+	case "external":
+		if p.Runtime.Port <= 0 {
+			return fmt.Errorf("platform %q: runtime.port is required in external mode (PAIR does not choose the port the user's server runs on)", key)
+		}
+		if p.Runtime.Ready == nil {
+			return fmt.Errorf("platform %q: runtime.ready is required in external mode (adoption probes it)", key)
+		}
 	default:
-		return fmt.Errorf("platform %q: runtime.mode %q invalid (want \"process\" or \"command\")", key, p.Runtime.Mode)
+		return fmt.Errorf("platform %q: runtime.mode %q invalid (want \"process\", \"command\" or \"external\")", key, p.Runtime.Mode)
 	}
 	if p.Install != nil {
 		if len(p.Install.Script) > 0 && (p.Install.Fetch != nil || len(p.Install.Run) > 0) {

@@ -1,0 +1,28 @@
+{
+  "$schema": "../manifest.schema.json",
+  "engine": "openai-compatible",
+  "display_name": "OpenAI-compatible server",
+  "manifest_version": 1,
+  "runtime": {
+    "mode": "external",
+    "bind": "127.0.0.1",
+    "port": 8000,
+    "ready": { "http": "http://127.0.0.1:{port}/v1/models", "status": 200, "timeout_s": 60 },
+    "health": { "http": "http://127.0.0.1:{port}/v1/models", "status": 200, "interval_s": 5 }
+  },
+  "platforms": {
+    "linux/amd64": {},
+    "linux/arm64": {},
+    "darwin/amd64": {},
+    "darwin/arm64": {},
+    "windows/amd64": {},
+    "windows/arm64": {}
+  },
+  "actions": {
+    "list_models": {
+      "description": "List the models the OpenAI-compatible server currently serves (vLLM, SGLang, llama.cpp server, ...).",
+      "http": { "method": "GET", "path": "/v1/models" },
+      "result": { "array": "data", "field": "id" }
+    }
+  }
+}

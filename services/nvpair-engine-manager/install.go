@@ -51,6 +51,11 @@ func (e *Executor) Install(ctx context.Context, engine string) error {
 		e.reportInstallFailed(engine, err)
 		return err
 	}
+	if st.plat.Runtime.modeOrDefault() == "external" {
+		// A user-managed engine has nothing to install: PAIR probes and adopts
+		// the server the user runs. An identified listener was adopted above.
+		return fmt.Errorf("engine %q is user-managed: there is nothing to install. Start your server on port %d and it is adopted automatically", engine, port)
+	}
 	inst := st.plat.Install
 	if inst == nil {
 		return fmt.Errorf("engine %q has no install block for this platform", engine)
