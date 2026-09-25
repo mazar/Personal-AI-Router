@@ -13,14 +13,40 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
 	"nvpair-shared/appdir"
 	"nvpair-shared/clustertrust"
+	"nvpair-shared/engines"
 	settings "nvpair-shared/enginesettings"
 	"nvpair-shared/noderec"
 )
+
+// settingsEngines lists the engines the broker publishes settings snapshots
+// for, in publish order. A facade-riding engine has a snapshot too — its port
+// apply is port-only — but reports the facade it rides as its proxy. Adding an
+// engine to the shared table requires deciding its place here;
+// TestSettingsEnginesMatchTheEngineTable holds this list against the table.
+var settingsEngines = []string{"ollama", "openai-compatible", "lmstudio"}
+
+// settingsFacadeEngine names the engine whose facade fronts an engine's proxy
+// surface. A facade-riding engine reports the facade it rides: its proxy port
+// is that facade's port, and its settings travel the same proxy process.
+func settingsFacadeEngine(engine string) string {
+	if e, ok := engines.ByName(engine); ok && e.SharedFacade != "" {
+		return e.SharedFacade
+	}
+	return engine
+}
+
+// enginesShareFacade reports whether two engines' proxy surfaces are the same
+// facade by construction. Their proxy ports collide no matter what either
+// journal says, so port validation must not treat that collision as a choice.
+func enginesShareFacade(a, b string) bool {
+	return settingsFacadeEngine(a) == settingsFacadeEngine(b)
+}
 
 type settingsReceipt struct {
 	Hash     string `json:"hash"`
@@ -159,7 +185,16 @@ func (b *Broker) settingsWorkerCall(ctx context.Context, method string, params a
 	return nil
 }
 
+// settingsProxy resolves the proxy process fronting an engine's settings
+// surface. A facade-riding engine resolves to the facade engine's proxy
+// process — the listener its traffic actually flows through. The engine name
+// itself is NOT remapped here: local-backend pushes and relay methods must
+// still carry the riding engine's name, so callers pair this with
+// settingsFacadeEngine where a facade-scoped status or method is needed.
 func (b *Broker) settingsProxy(engine string) *proxyProcess {
+	if facade := settingsFacadeEngine(engine); facade != engine {
+		engine = facade
+	}
 	if engine == "ollama" {
 		return b.getProxy()
 	}
@@ -169,8 +204,18 @@ func (b *Broker) settingsProxy(engine string) *proxyProcess {
 	return nil
 }
 
+// settingsProxyStatus reports whether the proxy fronting an engine is ready,
+// and the port its facade listens on.
+func (b *Broker) settingsProxyStatus(engine string) (bool, int) {
+	proxy := b.settingsProxy(engine)
+	if proxy == nil {
+		return false, 0
+	}
+	return proxy.Status(settingsFacadeEngine(engine))
+}
+
 func (b *Broker) settingsSnapshotLocked(ctx context.Context, engine string) (settings.Snapshot, error) {
-	if engine != "ollama" && engine != "lmstudio" {
+	if !slices.Contains(settingsEngines, engine) {
 		return settings.Snapshot{}, fmt.Errorf("this engine does not support settings")
 	}
 	if err := b.loadEngineSettingsLocked(); err != nil {
@@ -183,7 +228,7 @@ func (b *Broker) settingsSnapshotLocked(ctx context.Context, engine string) (set
 	proxyPort := 0
 	ready := false
 	if proxy := b.settingsProxy(engine); proxy != nil {
-		ready, proxyPort = proxy.Status(engine)
+		ready, proxyPort = proxy.Status(settingsFacadeEngine(engine))
 	}
 	record := b.engineSettings[engine]
 	if err := b.migrateSettingsArgumentsLocked(ctx, engine, record); err != nil {
@@ -214,6 +259,7 @@ func (b *Broker) settingsSnapshotLocked(ctx context.Context, engine string) (set
 	snapshot.EffectiveProxyPort = proxyPort
 	snapshot.Running = launch.Running
 	snapshot.Adopted = launch.Adopted
+	snapshot.External = launch.External
 	snapshot.Format = launch.Format
 	snapshot.Editable = launch.Editable && ready
 	snapshot.Reason = launch.Reason
@@ -233,7 +279,7 @@ func (b *Broker) settingsSnapshotLocked(ctx context.Context, engine string) (set
 
 func (b *Broker) publishSettingsLocked() {
 	all := make([]settings.Snapshot, 0, len(b.engineSettings))
-	for _, engine := range []string{"ollama", "lmstudio"} {
+	for _, engine := range settingsEngines {
 		if record := b.engineSettings[engine]; record != nil {
 			record.Snapshot.Sequence++
 			all = append(all, record.Snapshot)
@@ -253,6 +299,16 @@ func (b *Broker) validateSettingsPortsLocked(ctx context.Context, engine string,
 	}
 	if config.ServerPort == config.ProxyPort {
 		return fmt.Errorf("Server port and proxy port collide: both are %d. Choose different ports.", config.ServerPort)
+	}
+	// A facade-riding engine's proxy port is the shared facade's port and is
+	// not a setting. Accepting a different one would journal a port nothing
+	// serves and fight every later reconcile; the journal's own value is the
+	// comparison point because the facade may legitimately be down (live port
+	// 0) while the recorded choice stays correct.
+	if e, ok := engines.ByName(engine); ok && e.SharedFacade != "" && config.ProxyPort != current.Settings.ProxyPort {
+		facade, _ := engines.ByName(e.SharedFacade)
+		return fmt.Errorf("%s rides the %s proxy on port %d; its proxy port is not configurable",
+			e.DisplayName, facade.DisplayName, current.Settings.ProxyPort)
 	}
 	reserved := map[int]bool{engineManagerHTTPPort: true, engineControlPort: true, nodeInfoHTTPPort: true, errorsHTTPPort: true, workloadHTTPPort: true, clusterManagerHTTPPort: true}
 	if alias := b.currentOllamaHostAlias().Port; alias > 0 {
@@ -283,8 +339,11 @@ func (b *Broker) validateSettingsPortsLocked(ctx context.Context, engine string,
 			return fmt.Errorf("a selected port is reserved by another configured engine")
 		}
 	}
-	for _, other := range []string{"ollama", "lmstudio"} {
-		if other == engine {
+	for _, other := range settingsEngines {
+		if other == engine || enginesShareFacade(engine, other) {
+			// A facade-riding engine's proxy port IS the shared facade's
+			// port: treating that equality as a collision would refuse the
+			// only configuration the rider can have, in both directions.
 			continue
 		}
 		if record := b.engineSettings[other]; record != nil {
@@ -294,7 +353,7 @@ func (b *Broker) validateSettingsPortsLocked(ctx context.Context, engine string,
 			}
 		}
 		if proxy := b.settingsProxy(other); proxy != nil {
-			_, port := proxy.Status(other)
+			_, port := proxy.Status(settingsFacadeEngine(other))
 			if port == config.ServerPort || port == config.ProxyPort {
 				return fmt.Errorf("a selected port is already used by another proxy")
 			}
@@ -324,11 +383,17 @@ func (b *Broker) previewSettingsLocked(ctx context.Context, p settings.Request) 
 		return preview, err
 	}
 	preview.Revision = current.Revision
-	preview.Rebind = preview.Settings.ProxyPort != current.EffectiveProxyPort
+	// A user-managed engine has no facade to rebind — its proxy port is fixed
+	// to the shared facade's — so a port-only apply never moves a listener.
+	preview.Rebind = preview.Settings.ProxyPort != current.EffectiveProxyPort && !current.External
 	if preview.Errors == nil {
 		preview.Errors = make(map[string]string)
 	}
-	if !current.Editable {
+	// A user-managed engine is never "editable" in the launch sense — there is
+	// no launch — but its port-only apply is still legitimate, so the
+	// user-managed reason must not block it. Anything else that made the
+	// snapshot non-editable still does.
+	if !current.Editable && !current.External {
 		preview.Errors["settings"] = current.Reason
 	}
 	if len(preview.Errors) == 0 && preview.Conflict == nil {
@@ -349,6 +414,9 @@ func (b *Broker) previewSettingsLocked(ctx context.Context, p settings.Request) 
 func (b *Broker) runSettingsOperationLocked(ctx context.Context, engine string, record *engineSettingsRecord) error {
 	if err := b.migrateSettingsArgumentsLocked(ctx, engine, record); err != nil {
 		return err
+	}
+	if record.Snapshot.External {
+		return b.runExternalSettingsOperationLocked(ctx, engine, record)
 	}
 	service := noderec.ServiceOllama
 	if engine == "lmstudio" {
@@ -418,6 +486,68 @@ func (b *Broker) runSettingsOperationLocked(ctx context.Context, engine string, 
 	}
 	if err == nil {
 		record.Resume = false
+	}
+	if receipt, exists := record.Receipts[record.Snapshot.RequestID]; exists {
+		receipt.Phase = record.Snapshot.Phase
+		record.Receipts[record.Snapshot.RequestID] = receipt
+	}
+	if saveErr := b.saveEngineSettingsLocked(); saveErr != nil {
+		record.Snapshot.Phase = "failed"
+		record.Snapshot.Error = "The operation result could not be saved. Reload to reconcile the device."
+		if receipt, exists := record.Receipts[record.Snapshot.RequestID]; exists {
+			receipt.Phase = "failed"
+			record.Receipts[record.Snapshot.RequestID] = receipt
+		}
+		err = saveErr
+	}
+	b.publishSettingsLocked()
+	return err
+}
+
+// runExternalSettingsOperationLocked applies a user-managed engine's accepted
+// record. The apply is port-only: there is no PAIR-owned process to stop, no
+// facade to reposition and no launch to store — the worker persists where PAIR
+// probes and routes and re-probes, and the advertise loop reconciles discovery
+// and the proxy's local backend within one poll interval. In particular no
+// discovery service is unregistered here: the rider rides the ol registration,
+// which the advertise loop owns, and dropping it would blank the node's
+// reachable endpoint for the length of one apply. The caller holds
+// engineConfigMu; it is released around the engine-manager call exactly as in
+// the managed path.
+func (b *Broker) runExternalSettingsOperationLocked(ctx context.Context, engine string, record *engineSettingsRecord) error {
+	configure := settings.Configure{Engine: engine, Settings: record.Snapshot.Settings, Resume: record.Resume}
+	launch, err := func() (settings.LaunchState, error) {
+		b.engineConfigMu.Unlock()
+		defer b.engineConfigMu.Lock()
+		var launch settings.LaunchState
+		err := b.settingsWorkerCall(ctx, "engine:configure-launch", configure, &launch)
+		if err != nil {
+			// A failed RPC carries no result, so read the observed facts back
+			// here too and keep the whole worker round trip off the lock.
+			launch = settings.LaunchState{}
+			_ = b.settingsWorkerCall(ctx, "engine:get-launch", map[string]string{"engine": engine}, &launch)
+		}
+		return launch, err
+	}()
+
+	if err != nil {
+		record.Snapshot.Phase = "failed"
+		record.Snapshot.Error = err.Error()
+	} else {
+		record.Snapshot.Phase = "succeeded"
+		record.Snapshot.Error = ""
+		record.Snapshot.AppliedRevision = record.Snapshot.Revision
+		record.Resume = false
+	}
+	// Refresh observed facts without replacing the accepted desired revision;
+	// never publish the pre-operation running state. The proxy port is left to
+	// the facade engine's own snapshot: it is not part of this apply.
+	if launch.Engine != "" {
+		record.Snapshot.Running = launch.Running
+		record.Snapshot.Adopted = launch.Adopted
+		record.Snapshot.EffectiveServerPort = launch.EffectivePort
+		record.Snapshot.Editable = launch.Editable
+		record.Snapshot.Reason = launch.Reason
 	}
 	if receipt, exists := record.Receipts[record.Snapshot.RequestID]; exists {
 		receipt.Phase = record.Snapshot.Phase
@@ -676,6 +806,13 @@ func (b *Broker) handleSettingsRelay(raw json.RawMessage) {
 }
 
 func (b *Broker) rebindSettingsProxy(engine string, port int) error {
+	// A facade-riding engine has no listener of its own to rebind — its proxy
+	// port is the shared facade's, which only the facade engine's settings
+	// move. The worker never sends this rebind for such an engine; refusing
+	// keeps a stale relay from touching the wrong engine's state.
+	if riding := settingsFacadeEngine(engine); riding != engine {
+		return fmt.Errorf("%s rides the %s proxy; its proxy port is not configurable", engine, riding)
+	}
 	p := b.settingsProxy(engine)
 	if p == nil {
 		return fmt.Errorf("proxy unavailable")
@@ -723,7 +860,7 @@ func (b *Broker) refreshEngineSettings(ctx context.Context) {
 				readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 				defer cancel()
 				changed := false
-				for _, engine := range []string{"ollama", "lmstudio"} {
+				for _, engine := range settingsEngines {
 					var before settings.Snapshot
 					if r := b.engineSettings[engine]; r != nil {
 						before = r.Snapshot

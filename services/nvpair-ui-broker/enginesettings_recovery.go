@@ -74,6 +74,15 @@ func (b *Broker) prepareExplicitEngineSettings(engine string) bool {
 	}
 	profile, _ := engineProxyProfileFor(engine)
 	b.engineProxy(profile).explicitSettings.Store(true)
+	if profile.SharedFacade != "" {
+		// A facade-riding engine owns no facade state and no alias, so there
+		// is nothing to restore beyond the explicit marker. Its ports are
+		// seeded onto its OWN runtime — reaching the facade-owning branches
+		// below would write another engine's state under this engine's name.
+		b.engineProxy(profile).backendPort.Store(int32(config.ServerPort))
+		b.engineProxy(profile).startupPort.Store(int32(config.ProxyPort))
+		return true
+	}
 	if engine == "ollama" {
 		b.ollamaState().managedFacade.Store(false)
 		b.managedOllamaBackend.Store(0)

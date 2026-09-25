@@ -23,6 +23,13 @@ import (
 var (
 	defaultOllamaPort   = ollamaProxyProfile.FacadePort
 	defaultLMStudioPort = lmstudioProxyProfile.FacadePort
+	// defaultOpenAICompatiblePort mirrors the user-managed engine's manifest
+	// port: the fallback probed when engine-manager cannot report where the
+	// user's server actually listens. PAIR never binds this port — it is only
+	// ever probed and routed to. Changing the manifest port means changing it
+	// here too; the duplication is the price of the broker not reading
+	// engine-manager's manifests.
+	defaultOpenAICompatiblePort = 8000
 )
 
 const (
@@ -74,18 +81,24 @@ func (b *Broker) runAutoAdvertise(ctx context.Context) {
 	}
 }
 
-// reconcileAdvertise checks local ollama and brings this node's ol registration
-// into line with it. Post-secure-inference the advertised ol endpoint is the
-// promoted PROXY port, never the engine port: peers dial the proxy over cluster
-// mTLS and it forwards to the loopback engine. The engine's real (loopback) port
-// is a private detail handed only to the local proxy via node/set-local-backend.
+// reconcileAdvertise checks the local Ollama engine AND the OpenAI-compatible
+// engine riding its facade, and brings this node's ol registration into line
+// with them. Post-secure-inference the advertised ol endpoint is the promoted
+// PROXY port, never an engine port: peers dial the proxy over cluster mTLS and
+// it forwards to the loopback engine. Each engine's real (loopback) port is a
+// private detail handed only to the local proxy via node/set-local-backend.
 //
-//   - engine healthy + proxy up -> register {ol, PROXY port} + set-local-backend{enginePort, healthy}
-//   - otherwise                  -> unregister ol + clear the proxy's local backend
+//   - either engine healthy + proxy up -> register {ol, PROXY port}
+//   - otherwise                        -> unregister ol
 //
-// The model list is not carried here — it lives on engine-manager's em
-// /v1/models endpoint (registered separately), which peers fetch during
-// enrichment.
+// Both engines share this loop deliberately rather than running a sibling one:
+// they reconcile the SAME ol registration, and two loops would unregister each
+// other on every tick. The rider contributes no facade port — its backend is
+// pushed under its own engine name and the facade forwards to it by model.
+//
+// The served model inventories are still carried on engine-manager's em
+// /v1/models endpoint for peers; the sweep is ALSO polled here so each local
+// backend payload can carry its engine's models for the proxy's own routing.
 func (b *Broker) reconcileAdvertise(client *http.Client) {
 	b.engineConfigMu.Lock()
 	defer b.engineConfigMu.Unlock()
@@ -96,22 +109,31 @@ func (b *Broker) reconcileAdvertise(client *http.Client) {
 	if b.ollamaFacadeIsPendingBackend() {
 		b.unregisterService(noderec.ServiceOllama)
 		b.setProxyLocalBackend(b.getProxy(), "ollama", 0, false)
+		b.setProxyLocalBackend(b.getProxy(), openAICompatibleProxyProfile.Name, 0, false)
 		return
 	}
-	enginePort, probe := b.localEnginePort("ollama", defaultOllamaPort)
+	b.refreshEngineModelsLocked()
+	ollamaPort, ollamaProbe := b.localEnginePort("ollama", defaultOllamaPort)
+	riderPort, riderProbe := b.localEnginePort(openAICompatibleProxyProfile.Name, defaultOpenAICompatiblePort)
 	proxyPort := b.proxyListenPort()
-	// Advertise only when the engine is healthy AND the proxy is up AND the two
+	// Advertise only when an engine is healthy AND the proxy is up AND the two
 	// ports differ. Equal ports mean we can't tell the engine from the proxy
 	// (or there is no separate engine), and setting the local backend to the
 	// proxy's own port would make the ingress forward to itself.
-	up := probe && proxyPort != 0 && enginePort != proxyPort && checkEngineHealth(ollamaProxyProfile, client, enginePort)
-	if up {
+	ollamaUp := ollamaProbe && proxyPort != 0 && ollamaPort != proxyPort && checkEngineHealth(ollamaProxyProfile, client, ollamaPort)
+	// The rider answers the same facade, so its guard is the facade's port.
+	// A user pointing their server at the proxy's own port would otherwise
+	// hand the ingress a backend that forwards to itself.
+	riderUp := riderProbe && proxyPort != 0 && riderPort != proxyPort && checkEngineHealth(openAICompatibleProxyProfile, client, riderPort)
+	if ollamaUp || riderUp {
 		b.registerService(noderec.RegisterParams{Service: noderec.ServiceOllama, Port: proxyPort})
-		b.setProxyLocalBackend(b.getProxy(), "ollama", enginePort, true)
 	} else {
 		b.unregisterService(noderec.ServiceOllama)
-		b.setProxyLocalBackend(b.getProxy(), "ollama", enginePort, false)
 	}
+	// Each backend is reported with its own health: one engine going down
+	// flips only its own leg, and the facade keeps serving the other's models.
+	b.setProxyLocalBackend(b.getProxy(), "ollama", ollamaPort, ollamaUp)
+	b.setProxyLocalBackend(b.getProxy(), openAICompatibleProxyProfile.Name, riderPort, riderUp)
 }
 
 func (b *Broker) ollamaFacadeIsPendingBackend() bool {
@@ -196,6 +218,12 @@ type proxyLocalBackend struct {
 	Host    string `json:"host"`
 	Port    int    `json:"port"`
 	Healthy bool   `json:"healthy"`
+	// Models is the engine's last-known served inventory, from engine:models'
+	// modelsByEngine. The ingress uses it to pick which local backend serves a
+	// model without probing the engines itself. Empty means "nothing known
+	// served yet" and routes nothing by model; the Healthy flag decides
+	// whether the backend is usable at all.
+	Models []string `json:"models,omitempty"`
 }
 
 // setProxyLocalBackend hands the proxy its local (loopback) engine endpoint, or
@@ -206,12 +234,56 @@ func (b *Broker) setProxyLocalBackend(p *proxyProcess, engine string, port int, 
 	if p == nil {
 		return
 	}
-	b.callProxyManual(p, engine, "node/set-local-backend", proxyLocalBackend{
+	// A facade-riding engine owns no listener: its backend entry is stored by
+	// the facade it rides, so the call is addressed to that facade engine
+	// while the payload keeps naming the rider. Addressing it to the rider
+	// would reach a proxy with no facade by that name and be refused.
+	addressed := engine
+	if profile, ok := engineProxyProfileFor(engine); ok && profile.SharedFacade != "" {
+		addressed = profile.SharedFacade
+	}
+	b.callProxyManual(p, addressed, "node/set-local-backend", proxyLocalBackend{
 		Engine:  engine,
 		Host:    "127.0.0.1",
 		Port:    port,
 		Healthy: healthy,
+		Models:  b.cachedEngineModels(engine),
 	}, "local-backend")
+}
+
+// refreshEngineModelsLocked polls engine-manager's engine:models sweep and
+// caches each engine's served inventory. Only non-empty inventories are
+// stored, so a sweep that fails or races an engine restart never blanks what
+// the local backend payloads carry — the Healthy flag is what retires a
+// backend, not a stale model list. Caller holds engineConfigMu.
+func (b *Broker) refreshEngineModelsLocked() {
+	em := b.getEngineMgr()
+	if em == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var result struct {
+		ByEngine map[string][]string `json:"modelsByEngine,omitempty"`
+	}
+	if err := b.settingsWorkerCall(ctx, "engine:models", nil, &result); err != nil {
+		return
+	}
+	for engine, models := range result.ByEngine {
+		if len(models) == 0 {
+			continue
+		}
+		if b.engineModels == nil {
+			b.engineModels = make(map[string][]string, len(result.ByEngine))
+		}
+		b.engineModels[engine] = models
+	}
+}
+
+// cachedEngineModels returns the last non-empty inventory cached for an
+// engine, or nil. Caller holds engineConfigMu.
+func (b *Broker) cachedEngineModels(engine string) []string {
+	return b.engineModels[engine]
 }
 
 // localEnginePort asks engine-manager for the port the named engine is actually

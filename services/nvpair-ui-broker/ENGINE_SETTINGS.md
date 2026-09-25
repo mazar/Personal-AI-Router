@@ -5,10 +5,10 @@ SPDX-License-Identifier: Apache-2.0
 
 # Engine settings protocol
 
-The broker owns combined settings operations for Ollama and LM Studio. Each
-node owns its own configuration. `nodeId` selects a discovered, currently pinned
-peer; omission or the local host ID selects this node. Bulk propagation is not
-part of this API.
+The broker owns combined settings operations for Ollama, LM Studio and the
+user-managed OpenAI-compatible engine. Each node owns its own configuration.
+`nodeId` selects a discovered, currently pinned peer; omission or the local host
+ID selects this node. Bulk propagation is not part of this API.
 
 | Method | Request | Result |
 | --- | --- | --- |
@@ -16,10 +16,10 @@ part of this API.
 | `engine:preview-settings` | `{engine, nodeId?, expectedRevision, settings, resolution?}` | Normalized settings, errors, conflict, restart/rebind summary |
 | `engine:apply-settings` | Preview request plus `requestId` | `{revision, phase}` acknowledgement |
 
-`engine` is `ollama` or `lmstudio`. `settings` contains all three fields:
-`serverPort`, `proxyPort`, `launchText`. The last field contains arguments and
-leading environment assignments, without the executable or startup subcommand.
-The argument grammar is
+`engine` is `ollama`, `lmstudio` or `openai-compatible`. `settings` contains all
+three fields: `serverPort`, `proxyPort`, `launchText`. The last field contains
+arguments and leading environment assignments, without the executable or startup
+subcommand. The argument grammar is
 [`pair-arguments-v1`](../nvpair-engine-manager/LAUNCH_TEXT.md). Preview does not
 change component configuration or runtime. A snapshot read may persist the
 initial revision baseline or reconcile an external component change.
@@ -27,11 +27,24 @@ initial revision baseline or reconcile an external component change.
 Each full snapshot includes desired `settings`, `revision`, `appliedRevision`,
 `phase` (`idle`, `applying`, `succeeded`, `failed`), `requestId`, `error`,
 `effectiveServerPort`, `effectiveProxyPort`, `running`, `adopted`, `editable`,
-`reason`, `format`, `epoch`, and `sequence`. A configured runtime server port
-does not imply a listening server: consult `running`. The operation receipt is
-not a state update. Consume `engine:settings-changed` or fetch the full snapshot
-after a response loss. A renderer must retain dirty drafts and reject stale
-baseline revisions, even when only arguments changed.
+`external`, `reason`, `format`, `epoch`, and `sequence`. A configured runtime
+server port does not imply a listening server: consult `running`. The operation
+receipt is not a state update. Consume `engine:settings-changed` or fetch the
+full snapshot after a response loss. A renderer must retain dirty drafts and
+reject stale baseline revisions, even when only arguments changed.
+
+## User-managed engines
+
+A snapshot with `external` set describes an engine PAIR never installs, starts
+or stops — the user runs it in its own application, and PAIR only probes and
+routes to the configured server port. Its `launchText` is empty, `editable` is
+false, and the only meaningful change is `serverPort`: applying it persists
+where PAIR probes and routes and re-probes, with no restart and no facade
+choreography. `proxyPort` is not configurable — a facade-riding engine reports
+the facade it rides (for `openai-compatible`, the Ollama proxy's port), and a
+request that changes it is refused. Discovery and the proxy's local backend
+reconcile through the regular advertise loop within one poll interval, so no
+advertisement is suppressed during the apply.
 
 Declared CORS origin lists, switches and explicit booleans can only change on
 the engine's owning node. The broker derives an internal `preserveCORS` preview
@@ -56,7 +69,9 @@ PAIR services, aliases, other configured engines/proxies and occupied listeners.
 Only this engine's current running port and its proxy listener can be reused
 for a swap. Revalidation happens at Apply; OS bind remains the final arbiter of
 a competing process. Adopted process engines are read-only; command-mode
-engines require their official stop path.
+engines require their official stop path. A facade-riding engine and the facade
+it rides share one proxy port by construction, so that equality is not treated
+as a collision in either direction.
 
 A normalized no-op changes no runtime. Proxy-only edits do not restart the
 engine. A stopped engine remains stopped. Running launch/server changes stop

@@ -10,11 +10,60 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
+	"nvpair-shared/engines"
 	settings "nvpair-shared/enginesettings"
 )
+
+// Adding an engine to the shared table forces a settings decision: either it
+// belongs in settingsEngines, or the exclusion is a reviewed conclusion.
+func TestSettingsEnginesMatchTheEngineTable(t *testing.T) {
+	want := engines.Names()
+	slices.Sort(want)
+	got := slices.Clone(settingsEngines)
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
+		t.Fatalf("settingsEngines = %v, shared engine table = %v; review the new engine's settings story", got, want)
+	}
+}
+
+// An explicit rider record must be restored onto the rider's own runtime, and
+// must never reach the facade-owning engines' state.
+func TestPrepareExplicitEngineSettingsSeedsTheRidersOwnRuntime(t *testing.T) {
+	b := &Broker{clusterDir: filepath.Join(t.TempDir(), "cluster")}
+	b.engineSettingsLoaded = true
+	b.engineSettings = map[string]*engineSettingsRecord{
+		"openai-compatible": {
+			Explicit: true,
+			Snapshot: settings.Snapshot{Settings: settings.Config{ServerPort: 9001, ProxyPort: 9002}},
+		},
+	}
+	// Sentinels: if the rider's restore reached the ollama or lmstudio branch,
+	// one of these would move.
+	b.ollamaState().backendPort.Store(1111)
+	b.ollamaState().startupPort.Store(1112)
+	b.lmstudioState().backendPort.Store(1113)
+	b.lmstudioState().startupPort.Store(1114)
+
+	if !b.prepareExplicitEngineSettings("openai-compatible") {
+		t.Fatal("explicit settings were not restored")
+	}
+	if got := b.engineProxy(openAICompatibleProxyProfile).backendPort.Load(); got != 9001 {
+		t.Fatalf("rider backend port = %d, want 9001", got)
+	}
+	if got := b.engineProxy(openAICompatibleProxyProfile).startupPort.Load(); got != 9002 {
+		t.Fatalf("rider startup port = %d, want 9002", got)
+	}
+	if got := b.ollamaState().backendPort.Load(); got != 1111 {
+		t.Fatalf("rider restore moved ollama's backend port to %d", got)
+	}
+	if got := b.lmstudioState().startupPort.Load(); got != 1114 {
+		t.Fatalf("rider restore moved lmstudio's startup port to %d", got)
+	}
+}
 
 func TestSettingsRebindAddressesOnlyRequestedFacade(t *testing.T) {
 	for _, profile := range engineProxyProfiles {
@@ -23,6 +72,15 @@ func TestSettingsRebindAddressesOnlyRequestedFacade(t *testing.T) {
 			p := h.b.getProxy()
 			_, ollamaBefore := p.Status("ollama")
 			_, lmstudioBefore := p.Status("lmstudio")
+			if profile.SharedFacade != "" {
+				// A facade-riding engine has no listener of its own to rebind:
+				// its proxy port is the shared facade's, so a rebind must be
+				// refused rather than silently applied to the wrong engine.
+				if err := h.b.rebindSettingsProxy(profile.Name, 30000); err == nil {
+					t.Fatal("a facade-riding engine's rebind was accepted")
+				}
+				return
+			}
 			ln, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {
 				t.Fatal(err)
@@ -51,6 +109,12 @@ func TestSettingsRebindAddressesOnlyRequestedFacade(t *testing.T) {
 func TestExplicitSettingsBindFailurePreservesChosenPort(t *testing.T) {
 	for _, profile := range engineProxyProfiles {
 		t.Run(profile.Name, func(t *testing.T) {
+			if profile.SharedFacade != "" {
+				// A facade-riding engine never receives a facade/enable, so
+				// there is no bind-failure choreography to protect; its
+				// explicit-settings restore is covered by the seeding test.
+				t.Skip("no facade of its own to bind")
+			}
 			const requested = 25000
 			b := &Broker{codec: NewCodec(&bytes.Buffer{}), engineSettingsLoaded: true,
 				engineSettings: map[string]*engineSettingsRecord{profile.Name: {
