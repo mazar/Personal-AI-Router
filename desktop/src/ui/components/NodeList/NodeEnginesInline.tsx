@@ -3,6 +3,7 @@
 
 import { EnabledEngineTypes, EngineDisplayNames } from '@/shared/constants/engines'
 import { EngineType } from '@/shared/types/engines'
+import { EngineCapabilities } from '@/ui/constants/engine-capabilities'
 import { useEngineStatusStore } from '@/ui/stores/engine-status.store'
 import { useConnectionStore } from '@/ui/stores/connection.store'
 import { useNodesStore } from '@/ui/stores/nodes.store'
@@ -83,6 +84,24 @@ export default function NodeEnginesInline({ nodeId }: { nodeId: string }) {
                     b.status === 'uninstalling' ||
                     b.status === 'starting' ||
                     b.status === 'stopping'
+
+                if (EngineCapabilities[b.type].userManaged) {
+                    // A user-managed engine is started and stopped by its owner,
+                    // never by PAIR: the row reports health and nothing else.
+                    return (
+                        <Flex
+                            key={b.name}
+                            align="center"
+                            gap="2"
+                            className="shrink-0 no-drag-elements pair-engines-inline"
+                        >
+                            <Text kind="body/regular/sm" className="capitalize text-subtle-color">
+                                {b.status}
+                            </Text>
+                            <Text kind="body/regular/sm">{b.name}</Text>
+                        </Flex>
+                    )
+                }
 
                 if (b.status === 'not-installed' && !pending) {
                     return (

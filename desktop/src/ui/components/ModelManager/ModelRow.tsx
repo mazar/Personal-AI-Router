@@ -46,11 +46,15 @@ function ModelRowInner({
         // A command is already in flight for this model -- lock the whole menu so
         // the user cannot fire a second conflicting op before it resolves.
         const busy = pendingAction !== undefined
-        items.push({
-            id: 'load',
-            children: 'Load',
-            disabled: busy || isLoaded || !model.downloaded || !isRunning
-        })
+        // A user-managed engine's models are handled in its own application:
+        // PAIR issues no actions against them, so the row stays informational.
+        if (!capabilities.userManaged) {
+            items.push({
+                id: 'load',
+                children: 'Load',
+                disabled: busy || isLoaded || !model.downloaded || !isRunning
+            })
+        }
         if (capabilities.hasEject) {
             items.push({
                 id: 'eject',
@@ -69,6 +73,7 @@ function ModelRowInner({
     }, [
         capabilities.hasEject,
         capabilities.hasDeleteModel,
+        capabilities.userManaged,
         isLoaded,
         isRunning,
         model.downloaded,

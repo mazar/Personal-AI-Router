@@ -163,6 +163,9 @@ export function parseListModelNames(result: JsonValue | undefined): string[] {
     const obj = objectValue(result)
     if (!obj) throw new Error('list_models returned a non-object response')
     const names: string[] = []
+    // Ollama's native /api/tags envelope and the OpenAI /v1/models envelope are
+    // the two shapes an engine's list_models action returns raw — the manifest's
+    // result spec drives extraction for the models sweep, not this path.
     if (Array.isArray(obj.models)) {
         for (const entry of obj.models) {
             const row = objectValue(entry)
@@ -170,6 +173,16 @@ export function parseListModelNames(result: JsonValue | undefined): string[] {
             if (name) names.push(name)
         }
         if (obj.models.length > 0 && names.length === 0) {
+            throw new Error('list_models returned no usable model names')
+        }
+        return names
+    }
+    if (Array.isArray(obj.data)) {
+        for (const entry of obj.data) {
+            const name = stringValue(objectValue(entry)?.id)
+            if (name) names.push(name)
+        }
+        if (obj.data.length > 0 && names.length === 0) {
             throw new Error('list_models returned no usable model names')
         }
         return names

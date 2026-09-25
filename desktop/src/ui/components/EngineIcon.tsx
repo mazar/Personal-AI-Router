@@ -39,5 +39,27 @@ export default function EngineIcon({ type, size = 32 }: { type: EngineType; size
         )
     }
 
+    // The user-managed engine has no vendor to brand: a generic server glyph.
+    if (type === 'openai-compatible') {
+        return (
+            <div style={containerStyle}>
+                <svg
+                    viewBox="0 0 24 24"
+                    width="100%"
+                    height="100%"
+                    role="img"
+                    aria-label="OpenAI-compatible server"
+                >
+                    <g fill="none" stroke="#2f2f2f" strokeWidth="1.6">
+                        <rect x="4" y="4.5" width="16" height="6.4" rx="1.6" />
+                        <rect x="4" y="13.1" width="16" height="6.4" rx="1.6" />
+                    </g>
+                    <circle cx="7.4" cy="7.7" r="1.15" fill="#2f2f2f" />
+                    <circle cx="7.4" cy="16.3" r="1.15" fill="#2f2f2f" />
+                </svg>
+            </div>
+        )
+    }
+
     return null
 }

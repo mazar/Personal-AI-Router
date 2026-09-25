@@ -24,6 +24,7 @@ const baseline: EngineSettingsSnapshot = {
     running: true,
     adopted: false,
     editable: true,
+    external: false,
     reason: '',
     format: 'pair-arguments-v1',
     phase: 'idle',

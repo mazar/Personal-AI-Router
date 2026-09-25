@@ -203,9 +203,19 @@ export function BackendHeader({
                     )
                 })()}
 
+            {!isUnavailable && !isTransitioning && caps.userManaged && (
+                // A user-managed engine offers no start/stop — PAIR neither owns
+                // nor supervises the process — so its running state reads as
+                // plain status text fed by the health probe.
+                <Text kind="body/regular/sm" className="ml-2 capitalize text-subtle-color">
+                    {statusLabel[backend.processStatus]}
+                </Text>
+            )}
+
             {!isUnavailable &&
                 !isTransitioning &&
                 backend.processStatus !== 'not-installed' &&
+                !caps.userManaged &&
                 (() => {
                     const missingPrereqs = (backend.prerequisites ?? []).filter(p => !p.installed)
                     const prereqsMet = missingPrereqs.length === 0
@@ -249,15 +259,18 @@ export function BackendHeader({
                     return toggle
                 })()}
 
-            {!isUnavailable && !isTransitioning && backend.processStatus === 'not-installed' && (
-                <InstallButton
-                    backend={backend}
-                    targetOs={targetOs}
-                    isLocalNode={isLocalNode}
-                    disabled={disabled}
-                    onInstall={onInstall}
-                />
-            )}
+            {!isUnavailable &&
+                !isTransitioning &&
+                backend.processStatus === 'not-installed' &&
+                !caps.userManaged && (
+                    <InstallButton
+                        backend={backend}
+                        targetOs={targetOs}
+                        isLocalNode={isLocalNode}
+                        disabled={disabled}
+                        onInstall={onInstall}
+                    />
+                )}
         </Flex>
     )
 }

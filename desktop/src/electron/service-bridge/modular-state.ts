@@ -1099,6 +1099,18 @@ class ModularBridgeState {
         return port > 0 ? port : null
     }
 
+    /**
+     * The proxy port an engine's clients dial. A facade-riding engine owns no
+     * listener: its endpoint is the facade engine's (`openai-compatible` rides
+     * Ollama's facade), so it reports that. Null for engines with no proxy
+     * facade.
+     */
+    private statusProxyPort(engineType: EngineType): number | null {
+        if (engineType === 'openai-compatible') return this.getProxyPort('ollama')
+        if (isProxyEngine(engineType)) return this.getProxyPort(engineType)
+        return null
+    }
+
     getEngineInitialState(): EngineInitialState {
         const statuses: EngineStatusData[] = []
         const models: EngineModels[] = []
@@ -2068,7 +2080,7 @@ class ModularBridgeState {
                 nodeId,
                 processStatus: pending,
                 enginePort: facts && facts.running && facts.port > 0 ? facts.port : null,
-                proxyPort: isProxyEngine(engineType) ? this.getProxyPort(engineType) : null
+                proxyPort: this.statusProxyPort(engineType)
             }
         }
 
@@ -2088,10 +2100,11 @@ class ModularBridgeState {
                 // matching the `EngineStatusData.enginePort` contract. Auto-assign
                 // engines report 0 until started, which stays null.
                 enginePort: facts.installed && facts.port > 0 ? facts.port : null,
-                // Each proxy-fronted engine has its own broker proxy
-                // (`ollama-proxy` / `lmstudio-proxy`); report that engine's bound
-                // proxy port. Loopback-only engines get null.
-                proxyPort: isProxyEngine(engineType) ? this.getProxyPort(engineType) : null
+                // Each proxy-fronted engine reports the proxy port its clients
+                // dial (`statusProxyPort`): its own broker proxy, or the shared
+                // facade's for a facade-riding engine. Loopback-only engines
+                // get null.
+                proxyPort: this.statusProxyPort(engineType)
             }
         }
 
