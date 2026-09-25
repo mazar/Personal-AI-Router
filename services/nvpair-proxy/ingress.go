@@ -4,8 +4,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -21,23 +23,33 @@ const engineIdentityProbeHeader = "X-NVPAIR-Engine-Identity-Probe"
 // deliberately NOT sourced from the discovery overlay: a request that arrived
 // over the LAN mTLS ingress can only ever be dumped on this node's own local
 // engine, never re-routed to a peer, so the ingress path is strictly terminal
-// and cannot recurse or amplify.
+// and cannot recurse or amplify. A facade stores one entry per engine — the
+// facade engine itself, plus each facade-riding engine whose models share
+// this listener.
 type localBackend struct {
 	Engine  string `json:"engine"`
 	Host    string `json:"host"`
 	Port    int    `json:"port"`
 	Healthy bool   `json:"healthy"`
+	// Models is the engine's last-known served inventory, pushed by the broker
+	// alongside the endpoint. It is what picks which local backend serves an
+	// OpenAI-dialect inference call without probing the engines; empty routes
+	// nothing by model, and the Healthy flag decides whether the backend is
+	// usable at all.
+	Models []string `json:"models,omitempty"`
 }
 
-// currentLocalBackend snapshots the configured local engine.
-func (f *facade) currentLocalBackend() localBackend {
+// currentBackend snapshots the configured local backend for one engine.
+func (f *facade) currentBackend(engine string) (localBackend, bool) {
 	f.backendMu.RLock()
 	defer f.backendMu.RUnlock()
-	return f.backend
+	b, ok := f.backends[engine]
+	return b, ok
 }
 
 // setLocalBackend records (or, with a zero port / unhealthy flag, effectively
-// clears) the local engine this facade's ingress serves.
+// clears) the local engine the payload names: the facade engine when the
+// payload names none, or one of the engines riding this facade.
 //
 // A non-loopback host is rejected rather than stored. The ingress forwards a
 // pin-authenticated peer's request straight here without consulting discovery,
@@ -49,19 +61,34 @@ func (f *facade) setLocalBackend(b localBackend) error {
 	if b.Host != "" && !isLoopbackHost(b.Host) {
 		return fmt.Errorf("local backend host %q is not loopback", b.Host)
 	}
+	name := b.Engine
+	if name == "" {
+		name = f.profile.Name
+	}
+	if name != f.profile.Name {
+		rider, ok := profileFor(name)
+		if !ok || rider.SharedFacade != f.profile.Name {
+			return fmt.Errorf("engine %q does not ride the %s facade", b.Engine, f.profile.Name)
+		}
+	}
+	b.Engine = name
 	f.backendMu.Lock()
 	defer f.backendMu.Unlock()
-	f.backend = b
+	if f.backends == nil {
+		f.backends = make(map[string]localBackend)
+	}
+	f.backends[name] = b
 	return nil
 }
 
-// localBackendTarget returns the loopback URL of the current local engine, and
-// false when none is set/healthy (the ingress then answers 503 rather than
-// forwarding). The host defaults to 127.0.0.1, and setLocalBackend refuses to
-// store anything that is not loopback, so this is always a loopback target.
-func (f *facade) localBackendTarget() (*url.URL, bool) {
-	b := f.currentLocalBackend()
-	if b.Port <= 0 || !b.Healthy {
+// localBackendTarget returns the loopback URL of the named engine's local
+// backend, and false when none is set/healthy (the ingress then answers 503
+// rather than forwarding). The host defaults to 127.0.0.1, and setLocalBackend
+// refuses to store anything that is not loopback, so this is always a loopback
+// target.
+func (f *facade) localBackendTarget(engine string) (*url.URL, bool) {
+	b, ok := f.currentBackend(engine)
+	if !ok || b.Port <= 0 || !b.Healthy {
 		return nil, false
 	}
 	host := b.Host
@@ -113,15 +140,59 @@ func (f *facade) handleClusterIngress(w http.ResponseWriter, r *http.Request) {
 			"client certificate is not a pinned member of this node's cluster")
 		return
 	}
-	target, ok := f.localBackendTarget()
+	// Classify before choosing a backend. Model lists merge every local engine
+	// this facade serves; an inference call's model decides which of them
+	// serves it; everything else forwards to the facade engine verbatim,
+	// exactly as the single-backend ingress did.
+	rt, classified := f.profile.routeFor(r.Method, r.URL.Path)
+	engine := f.profile.Name
+	if classified && rt.Role.isModelList() {
+		f.serveModelList(w, r, rt.Role, f.localCandidates(f.profile.enginesFor(rt.Engines)))
+		return
+	}
+	if classified && rt.Role == roleInferencePOST {
+		// Buffering stays confined to classified inference: those bodies are
+		// small JSON, and the model field is what picks the engine. Everything
+		// else — including large streaming uploads a peer may forward — keeps
+		// the unbuffered path the single-backend ingress had.
+		bodyBytes, model := bufferBodyAndModel(r)
+		engine = f.backendEngineForModel(rt, model)
+		if bodyBytes != nil {
+			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		}
+	}
+	target, ok := f.localBackendTarget(engine)
 	if !ok {
 		writeIngressError(w, http.StatusServiceUnavailable, "no-local-backend",
-			"no local inference backend is available on this node")
+			fmt.Sprintf("no local %s engine is available on this node", engine))
 		return
 	}
 	slog.Debug("cluster ingress forwarding to local backend",
-		"peer", peer, "method", r.Method, "path", r.URL.Path, "target", target.Host)
+		"peer", peer, "method", r.Method, "path", r.URL.Path, "engine", engine, "target", target.Host)
 	f.reverseProxyToLocal(w, r, target)
+}
+
+// backendEngineForModel picks the local engine an inference route serves a
+// model with. A route granted to the facade engine alone is answered by it;
+// a multi-engine route matches the model against each local backend's
+// inventory under that engine's naming convention, preferring the facade
+// engine when both serve the model — the collision rule the merged model list
+// and the self candidates use. A model nothing attributes falls back to the
+// facade engine, which is what the single-backend ingress did; a backend with
+// no pushed inventory therefore never steals a request from it.
+func (f *facade) backendEngineForModel(rt route, model string) string {
+	if model != "" {
+		for _, ep := range f.profile.enginesFor(rt.Engines) {
+			b, ok := f.currentBackend(ep.Name)
+			if !ok || !b.Healthy || len(b.Models) == 0 {
+				continue
+			}
+			if inventoryAdvertisesModel(ep, b.Models, model) {
+				return ep.Name
+			}
+		}
+	}
+	return f.profile.Name
 }
 
 // reverseProxyToLocal streams the request to the local engine, preserving

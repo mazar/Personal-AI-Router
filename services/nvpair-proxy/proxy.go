@@ -20,6 +20,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -805,10 +806,15 @@ func (p *Proxy) emitWorkload(method string, w Workload) {
 // rewrite) and its resolved URL. peerUUID is set for a remote cluster peer:
 // the request is dialed over cluster mTLS to the peer's promoted proxy (https),
 // pinned to that peer's exact server cert. Empty peerUUID means a plain-HTTP
-// dial — the local backend (self) or an explicit manual node.
+// dial — the local backend (self) or an explicit manual node. engine records
+// which engine of the target serves this candidate — a local backend's own
+// engine, or the engine whose inventory advertised the model on a remote
+// node; empty for a remote candidate resolved without a model (control
+// traffic, model lists), where the target's own facade resolves the engine.
 type candidate struct {
 	id       string
 	url      *url.URL
+	engine   string
 	peerUUID string
 }
 
@@ -945,9 +951,25 @@ func (f *facade) serveModelList(w http.ResponseWriter, r *http.Request, role rou
 	results := make([]modelListResult, len(candidates))
 	var wg sync.WaitGroup
 	for i, cand := range candidates {
+		// A candidate carrying an engine this facade rides is one of this
+		// node's own backends (remote candidates carry no engine): it answers
+		// only the OpenAI list path, whatever dialect the caller asked in, and
+		// its records are re-shaped when the caller speaks the native one.
+		fetchPath := r.URL.Path
+		parseOpenAI := openAI
+		reshape := false
+		if _, isRider := f.ridingEngine(cand.engine); isRider {
+			fetchPath = "/v1/models"
+			parseOpenAI = true
+			reshape = !openAI
+		}
 		target := *cand.url
-		target.Path = r.URL.Path
-		target.RawPath = r.URL.RawPath
+		target.Path = fetchPath
+		if fetchPath == r.URL.Path {
+			target.RawPath = r.URL.RawPath
+		} else {
+			target.RawPath = ""
+		}
 		target.RawQuery = r.URL.RawQuery
 		upstream, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target.String(), nil)
 		if err != nil {
@@ -970,7 +992,7 @@ func (f *facade) serveModelList(w http.ResponseWriter, r *http.Request, role rou
 		}
 
 		wg.Add(1)
-		go func(i int, cand candidate, req *http.Request, client *http.Client) {
+		go func(i int, cand candidate, req *http.Request, client *http.Client, parseOpenAI, reshape bool) {
 			defer wg.Done()
 			resp, err := client.Do(req)
 			if err != nil {
@@ -1011,7 +1033,7 @@ func (f *facade) serveModelList(w http.ResponseWriter, r *http.Request, role rou
 				return
 			}
 			models := envelope.Models
-			if openAI {
+			if parseOpenAI {
 				models = envelope.Data
 			}
 			if models == nil {
@@ -1031,21 +1053,42 @@ func (f *facade) serveModelList(w http.ResponseWriter, r *http.Request, role rou
 					return
 				}
 				key := identity.ID
-				if !openAI {
+				if !parseOpenAI {
 					key = identity.Model
 					if key == "" {
 						key = identity.Name
 					}
+					key = f.profile.normalizeModel(key)
+				} else if reshape {
+					// A rider's record re-emitted into the native dialect
+					// dedupes under that dialect's convention too, so a model
+					// both engines of a node serve keeps the facade engine's
+					// record — the same collision rule the routing match and
+					// the engine pick apply.
 					key = f.profile.normalizeModel(key)
 				}
 				if key == "" {
 					results[i].err = fmt.Errorf("model record has no identity")
 					return
 				}
+				// A rider's record carries only the OpenAI "id"; a native
+				// caller's envelope identifies records by "model"/"name", so
+				// re-emit it as one — under the rider's own spelling, which is
+				// the identity its callers must send.
+				if reshape {
+					shaped, mErr := json.Marshal(struct {
+						Name string `json:"name"`
+					}{Name: identity.ID})
+					if mErr != nil {
+						results[i].err = mErr
+						return
+					}
+					raw = shaped
+				}
 				items = append(items, modelListItem{key: key, digest: identity.Digest, raw: raw})
 			}
 			results[i] = modelListResult{items: items, ok: true, headers: responseHeaders}
-		}(i, cand, upstream, client)
+		}(i, cand, upstream, client, parseOpenAI, reshape)
 	}
 	wg.Wait()
 
@@ -1162,12 +1205,13 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	// applies to inference routes; control endpoints retain their existing
 	// routing behavior even when their JSON happens to contain a model field.
 	bodyBytes, model := bufferBodyAndModel(r)
-	isInf := isInferenceRequest(f.profile, r.Method, r.URL.Path)
+	rt, classified := f.profile.routeFor(r.Method, r.URL.Path)
+	isInf := classified && rt.Role == roleInferencePOST
 	routingModel := ""
 	if isInf {
 		routingModel = model
 	}
-	candidates := f.resolveCandidates(routingModel)
+	candidates := f.resolveCandidates(routingModel, rt.Engines...)
 	if cors.IsPreflight(r) {
 		targets := make([]cors.Target, 0, len(candidates))
 		for _, cand := range candidates {
@@ -1208,13 +1252,13 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		p.releaseReservation(held)
 		held = reservation{}
 	}()
-	if role, ok := f.profile.roleFor(r.Method, r.URL.Path); ok && role.isModelList() {
+	if classified && rt.Role.isModelList() {
 		if len(candidates) > 0 {
 			_ = f.notify("proxy/request-started", RequestStartedEvent{
 				ID: reqID, Method: r.Method, Path: r.URL.Path, Target: "cluster",
 			})
 		}
-		status, err := f.serveModelList(w, r, role, candidates)
+		status, err := f.serveModelList(w, r, rt.Role, candidates)
 		errText := ""
 		if err != nil {
 			errText = err.Error()
@@ -1226,6 +1270,31 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(candidates) == 0 {
+		if isInf && model != "" {
+			if rider, mismatched := f.riderOnlyModel(rt, model); mismatched {
+				// The cluster serves this model, but only through an engine
+				// that does not answer this path's dialect. Name the way to
+				// call it rather than reporting the model as absent — the
+				// merged model list shows it, so a bare "no node advertises
+				// the model" would read as a lie.
+				writeIngressError(w, http.StatusBadGateway, "engine-dialect-mismatch",
+					fmt.Sprintf("model %q is served by the %s engine, which does not answer %s %s; call POST %s on this same port instead",
+						model, rider.Name, r.Method, r.URL.Path, "/v1/chat/completions"))
+				slog.Warn("proxy request rejected",
+					"id", reqID, "method", r.Method, "path", r.URL.Path,
+					"remote", r.RemoteAddr, "engine", rider.Name, "model", model,
+					"reason", "engine dialect mismatch")
+				_ = f.notify("proxy/request", RequestEvent{
+					ID:       reqID,
+					Method:   r.Method,
+					Path:     r.URL.Path,
+					Status:   http.StatusBadGateway,
+					Duration: time.Since(start).Milliseconds(),
+					Error:    "engine dialect mismatch",
+				})
+				return
+			}
+		}
 		rejectionBody := `{"error":"no active node selected or available"}`
 		rejectionError := "no active node"
 		if isInf && model != "" {
@@ -1296,9 +1365,14 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	if isInf && model != "" {
 		createdMs := start.UnixMilli()
 		wl = &Workload{
-			ID:        reqID,
-			Model:     model,
-			Engine:    f.profile.Name,
+			ID:    reqID,
+			Model: model,
+			// Engine is fixed for the workload's lifetime: the store identity
+			// is (origin, engine, runId, id), so a mid-flight change would
+			// fork the record and strand its queued half as a ghost. The
+			// first candidate is the dispatch this request tries first, which
+			// is the engine that serves it unless failover moves it.
+			Engine:    candidates[0].engine,
 			RunID:     p.runID,
 			State:     "queued",
 			CreatedAt: createdMs,
@@ -1931,13 +2005,20 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 // scheduler priority and stable ID fallback. The failover loop walks the
 // resulting owner list until a node returns a usable response.
 //
-// A node that resolves to this proxy's own listen address is dropped
+// allowed names the engines the route grants, facade engine first; empty
+// means the facade engine alone. It scopes both the model match (a model a
+// node serves only through an engine the route denies does not make it an
+// owner) and the self-target expansion (one candidate per granted engine with
+// a healthy local backend).
+//
+// A node that resolves to this proxy's own listen address is not dialed
 // (self-forward guard): with the proxy on Ollama's default :11434, a
 // local-Ollama advertisement can otherwise point right back at us and loop.
+// The self node resolves instead to the explicit local backends.
 //
 // Returns an empty slice when no forwarding target is available; the caller
 // treats that as the rejection path.
-func (f *facade) resolveCandidates(model string) []candidate {
+func (f *facade) resolveCandidates(model string, allowed ...string) []candidate {
 	p := f.host
 	id := f.SelectedID()
 
@@ -1951,12 +2032,14 @@ func (f *facade) resolveCandidates(model string) []candidate {
 	// freshly-paired one becomes one.
 	p.mesh.Refresh()
 
+	engines := f.profile.enginesFor(allowed)
+
 	nodes := f.discovery.Nodes()
 	known := len(nodes)
 	if model != "" {
 		owners := make([]Node, 0, len(nodes))
 		for _, node := range nodes {
-			if nodeAdvertisesModel(f.profile, node, model) {
+			if len(enginesAdvertising(engines, node, model)) > 0 {
 				owners = append(owners, node)
 			}
 		}
@@ -1989,19 +2072,41 @@ func (f *facade) resolveCandidates(model string) []candidate {
 		if u == nil {
 			return
 		}
+		if isSelfTarget(u, selfPort) || isAnyAliasSelfTarget(u, aliasBoundAddresses) {
+			// Our own advertised endpoint (ol now points at this proxy). Serve
+			// it from the explicit local backends — one candidate per engine
+			// the route grants with a healthy loopback backend — rather than
+			// dialing our own mTLS ingress, which would recurse. Ranking
+			// still used this node's real (discovered) model list above.
+			// A model-routed request expands only over the engines advertising
+			// the model here: a rider-only model dispatches straight to the
+			// rider's backend instead of burning a 404 on the facade engine's,
+			// and the workload's engine names the engine that will actually
+			// serve. Both engines advertising is the facade-first collision
+			// rule, unchanged.
+			serve := engines
+			if model != "" {
+				serve = enginesAdvertising(engines, n, model)
+			}
+			for _, local := range f.localCandidates(serve) {
+				local.id = n.ID
+				out = append(out, local)
+			}
+			return
+		}
+		// The engine whose inventory advertises the model here rides with the
+		// candidate: workload attribution follows it, and the serving node's
+		// own ingress resolves the same engine from the same inventory. Both
+		// engines advertising on one node resolves to the facade engine — the
+		// same collision rule the self expansion and the merged list use.
+		engine := ""
+		if model != "" {
+			if owners := enginesAdvertising(engines, n, model); len(owners) > 0 {
+				engine = owners[0].Name
+			}
+		}
 		peerUUID := ""
 		switch {
-		case isSelfTarget(u, selfPort) || isAnyAliasSelfTarget(u, aliasBoundAddresses):
-			// Our own advertised endpoint (ol now points at this proxy). Serve
-			// it from the explicit local backend — the loopback engine — rather
-			// than dialing our own mTLS ingress, which would recurse. Ranking
-			// still used this node's real (discovered) model list above.
-			lb, ok := f.localBackendTarget()
-			if !ok {
-				slog.Debug("resolveCandidates: no local backend for self", "node_id", n.ID)
-				return
-			}
-			u = lb
 		case p.mesh.HasPin(n.ClusterUUID):
 			// A pinned cluster peer: reach it only over mTLS to its promoted
 			// proxy (the ol port now advertises the proxy, not the engine).
@@ -2038,6 +2143,7 @@ func (f *facade) resolveCandidates(model string) []candidate {
 		out = append(out, candidate{
 			id:       n.ID,
 			url:      u,
+			engine:   engine,
 			peerUUID: peerUUID,
 		})
 	}
@@ -2064,6 +2170,80 @@ func (f *facade) resolveCandidates(model string) []candidate {
 		"selected", id, "priority", len(priority), "candidates", len(out),
 		"eligible", len(nodes), "known", known)
 	return out
+}
+
+// localCandidates expands this node's own presence into one candidate per
+// healthy local backend whose engine the grant allows, facade engine first.
+// Callers stamp the discovery node id onto each. A candidate records its
+// engine, which is what tells the model-list fan-out to fetch a rider in its
+// own OpenAI dialect and what keeps workload attribution on the engine that
+// actually serves.
+func (f *facade) localCandidates(engines []engineProfile) []candidate {
+	out := make([]candidate, 0, len(engines))
+	for _, ep := range engines {
+		u, ok := f.localBackendTarget(ep.Name)
+		if !ok {
+			slog.Debug("resolveCandidates: no healthy local backend", "engine", ep.Name)
+			continue
+		}
+		out = append(out, candidate{url: u, engine: ep.Name})
+	}
+	return out
+}
+
+// ridingEngine resolves a facade-riding engine of this facade by name. It is
+// how the model-list fan-out tells a rider backend — fetched in its own
+// OpenAI dialect — from a facade-dialect source.
+func (f *facade) ridingEngine(name string) (engineProfile, bool) {
+	for _, rider := range f.profile.RidingEngines {
+		if rider.Name == name {
+			return rider, true
+		}
+	}
+	return engineProfile{}, false
+}
+
+// engineAdvertisingModel reports whether any inventory this facade can see —
+// a discovery node's per-engine list or a healthy local backend — advertises
+// the model under the engine's naming convention.
+func (f *facade) engineAdvertisingModel(ep engineProfile, model string) bool {
+	for _, n := range f.discovery.Nodes() {
+		if nodeAdvertisesModel(ep, n, model) {
+			return true
+		}
+	}
+	if b, ok := f.currentBackend(ep.Name); ok && b.Healthy {
+		return inventoryAdvertisesModel(ep, b.Models, model)
+	}
+	return false
+}
+
+// riderOnlyModel names a facade-riding engine that advertises the model
+// somewhere this facade can see when the facade engine advertises it nowhere
+// and the route would not have reached a rider anyway. That is the one
+// empty-resolution case with a better answer than "no node advertises the
+// model": the model exists, but only behind an engine this path's dialect
+// cannot reach.
+func (f *facade) riderOnlyModel(rt route, model string) (engineProfile, bool) {
+	if model == "" || len(f.profile.RidingEngines) == 0 {
+		return engineProfile{}, false
+	}
+	for _, rider := range f.profile.RidingEngines {
+		if slices.Contains(rt.Engines, rider.Name) {
+			// The route already reaches this rider: an empty resolution is an
+			// availability problem, not a dialect one.
+			return engineProfile{}, false
+		}
+	}
+	if f.engineAdvertisingModel(f.profile, model) {
+		return engineProfile{}, false
+	}
+	for _, rider := range f.profile.RidingEngines {
+		if f.engineAdvertisingModel(rider, model) {
+			return rider, true
+		}
+	}
+	return engineProfile{}, false
 }
 
 // reservation is one in-flight dispatch this proxy has made since the last
@@ -2217,24 +2397,55 @@ func (p *Proxy) moveReservation(r reservation, nodeID string) reservation {
 	}
 }
 
-// nodeAdvertisesModel reports whether a node's advertised inventory contains
-// the requested model, under the engine's naming convention. Both sides are
-// normalized so the answer agrees with the federated model list's dedupe key;
-// if they disagreed the proxy could advertise a model it then refuses to route.
+// nodeAdvertisesModel reports whether a node's inventory contains the
+// requested model for the given engine, under that engine's naming
+// convention. Both sides are normalized so the answer agrees with the
+// federated model list's dedupe key; if they disagreed the proxy could
+// advertise a model it then refuses to route.
+//
+// The inventory is per engine: a record carrying attribution answers from the
+// named engine's own list. A record without one predates attribution, and its
+// flat list is the facade engine's — a facade-riding engine serves nothing
+// such a record can prove, because a peer that predates facade-riding engines
+// cannot be running one.
 //
 // Kept a free function taking the profile so the match is testable without a
 // Proxy.
 func nodeAdvertisesModel(p engineProfile, n Node, model string) bool {
+	models := n.ModelsByEngine[p.Name]
+	if n.ModelsByEngine == nil && p.SharedFacade == "" {
+		models = n.Models
+	}
+	return inventoryAdvertisesModel(p, models, model)
+}
+
+// inventoryAdvertisesModel is nodeAdvertisesModel's match against a plain
+// inventory — a local backend's pushed Models — with the same normalization
+// contract.
+func inventoryAdvertisesModel(p engineProfile, models []string, model string) bool {
 	requested := p.normalizeModel(model)
 	if requested == "" {
 		return false
 	}
-	for _, available := range n.Models {
+	for _, available := range models {
 		if p.normalizeModel(available) == requested {
 			return true
 		}
 	}
 	return false
+}
+
+// enginesAdvertising returns the engine profiles whose inventory on a node
+// advertises the model, in the order given — facade engine first, so the
+// first entry is the engine a collision resolves to.
+func enginesAdvertising(engines []engineProfile, n Node, model string) []engineProfile {
+	var out []engineProfile
+	for _, ep := range engines {
+		if nodeAdvertisesModel(ep, n, model) {
+			out = append(out, ep)
+		}
+	}
+	return out
 }
 
 // isSelfTarget reports whether u points back at this proxy's own listener.
@@ -2543,7 +2754,25 @@ func subscribedToNode(p engineProfile, n noderec.DirectoryNode) (Node, bool) {
 		// accepted as an Ollama owner here (falls back to the union for a peer
 		// that sends no attribution — see DirectoryNode.EngineModels).
 		Models: append([]string(nil), n.EngineModels(p.Name)...),
+		// Keep the per-engine attribution the routing match reads: the facade
+		// engine's list, plus each facade-riding engine's own. A rider's list
+		// has no legacy fallback — a peer whose records carry no attribution
+		// predates facade-riding engines and serves none.
+		ModelsByEngine: engineInventory(p, n),
 	}, true
+}
+
+// engineInventory projects a relay record's per-engine model attribution for
+// a facade and the engines riding it. The facade engine keeps the
+// EngineModels legacy fallback (a peer that sends no attribution may still
+// serve its flat list); a rider reads its own attribution only.
+func engineInventory(p engineProfile, n noderec.DirectoryNode) map[string][]string {
+	inv := make(map[string][]string, len(p.RidingEngines)+1)
+	inv[p.Name] = append([]string(nil), n.EngineModels(p.Name)...)
+	for _, rider := range p.RidingEngines {
+		inv[rider.Name] = append([]string(nil), n.ModelsByEngine[rider.Name]...)
+	}
+	return inv
 }
 
 func (p *Proxy) readLoop(ctx context.Context) error {
@@ -2766,6 +2995,13 @@ func (p *Proxy) handleMessage(msg *Message) {
 			p.codec.RespondError(msg.ID, -32602, "id, port, and at least one address are required")
 			return
 		}
+		// A manual node's flat model list is its facade engine's inventory, so
+		// attribute it for routing's per-engine match. The add-manual wire carries
+		// no per-engine attribution: a manual node's rider inventory, if any,
+		// stays unknown (deferred — see spec.md).
+		if len(node.Models) > 0 {
+			node.ModelsByEngine = map[string][]string{f.profile.Name: node.Models}
+		}
 		added := f.discovery.AddManual(node)
 		if err := p.codec.Respond(msg.ID, map[string]bool{"added": added}); err != nil {
 			log.Printf("failed to respond to node/add-manual: %v", err)
@@ -2807,25 +3043,21 @@ func (p *Proxy) handleMessage(msg *Message) {
 		}
 		var b localBackend
 		if err := json.Unmarshal(msg.Params, &b); err != nil {
-			p.codec.RespondError(msg.ID, -32602, "invalid params: expected {\"engine\",\"host\",\"port\",\"healthy\"}")
+			p.codec.RespondError(msg.ID, -32602, "invalid params: expected {\"engine\",\"host\",\"port\",\"healthy\",\"models\"}")
 			return
 		}
-		// The address decides which facade this applies to, so a payload naming
-		// a different engine is a caller bug, not a preference. Accepting it
-		// would point one engine's ingress and self-candidate at the other
-		// engine's port — and the old log line, which echoed the payload,
-		// would have named the wrong engine and hidden the cross-wire.
-		if b.Engine != "" && b.Engine != engine {
-			p.codec.RespondError(msg.ID, -32602, fmt.Sprintf(
-				"params name engine %q but the request is addressed to %q", b.Engine, engine))
-			return
-		}
+		// setLocalBackend owns the validation: the payload must name the
+		// addressed facade engine (or name nothing) or one of the engines
+		// riding it, and its host must be loopback. Accepting anything else
+		// would point one engine's ingress and self-candidates at another
+		// engine's port, or store a backend no route can ever select.
 		if err := f.setLocalBackend(b); err != nil {
 			p.codec.RespondError(msg.ID, -32602, err.Error())
 			return
 		}
 		slog.Info("local backend updated",
-			"engine", f.profile.Name, "host", b.Host, "port", b.Port, "healthy", b.Healthy)
+			"engine", b.Engine, "host", b.Host, "port", b.Port, "healthy", b.Healthy,
+			"models", len(b.Models))
 		if err := p.codec.Respond(msg.ID, map[string]bool{"ok": true}); err != nil {
 			log.Printf("failed to respond to node/set-local-backend: %v", err)
 		}

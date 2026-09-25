@@ -80,6 +80,11 @@ const (
 type route struct {
 	Path string
 	Role routeRole
+	// Engines names the engines allowed to serve this path, facade engine
+	// first. Nil means the facade engine alone: every route on a facade
+	// without riding engines, and on Ollama's facade the native and Anthropic
+	// dialects its riders do not speak.
+	Engines []string
 }
 
 // engineProfile is everything the proxy needs to front one engine.
@@ -115,22 +120,44 @@ type engineProfile struct {
 	// claim one names that variable. Gating on this makes the scoping
 	// enforced rather than left to the broker's restraint in passing the flag.
 	SupportsHostAlias bool
+
+	// RidingEngines lists the facade-less engines whose models this facade
+	// serves alongside the facade engine's own. Empty for every facade but
+	// Ollama's, which carries the user-managed OpenAI-compatible server.
+	// Riders never appear in profiles — they front no listener of their own,
+	// so enableFacade refuses them — and this list is the only way their
+	// profiles are reached.
+	RidingEngines []engineProfile
 }
 
+// ollamaFacadeEngines is the engine grant on the Ollama facade's shared
+// routes: the facade engine first, then the facade-riding OpenAI-compatible
+// server. Declared before the route tables because they name it; a test pins
+// the names against the shared engine table.
+var ollamaFacadeEngines = []string{"ollama", "openai-compatible"}
+
 // ollamaBaseRoutes is the engine-specific surface that Ollama exposes before
-// the shared compatibility routes are added.
+// the shared compatibility routes are added. The native inference routes
+// carry no engine grant: they are Ollama's dialect alone. The two model lists
+// are granted to both engines, because a merged list is what answers them.
 var ollamaBaseRoutes = []route{
 	{Path: "/api/generate", Role: roleInferencePOST},
 	{Path: "/api/chat", Role: roleInferencePOST},
 	{Path: "/api/embeddings", Role: roleInferencePOST},
 	{Path: "/api/embed", Role: roleInferencePOST},
-	{Path: "/api/tags", Role: roleModelListNativeGET},
-	{Path: "/v1/models", Role: roleModelListOpenAIGET},
+	{Path: "/api/tags", Role: roleModelListNativeGET, Engines: ollamaFacadeEngines},
+	{Path: "/v1/models", Role: roleModelListOpenAIGET, Engines: ollamaFacadeEngines},
 }
 
 // lmStudioBaseRoutes is the engine-specific surface that LM Studio exposes
 // before the shared compatibility routes are added.
 var lmStudioBaseRoutes = []route{
+	{Path: "/v1/models", Role: roleModelListOpenAIGET},
+}
+
+// openAICompatibleBaseRoutes is the surface a facade-riding OpenAI-compatible
+// server exposes beyond the shared inference routes.
+var openAICompatibleBaseRoutes = []route{
 	{Path: "/v1/models", Role: roleModelListOpenAIGET},
 }
 
@@ -151,7 +178,19 @@ var profiles = buildProfiles()
 func buildProfiles() []engineProfile {
 	ollama, _ := engines.ByName("ollama")
 	lmstudio, _ := engines.ByName("lmstudio")
-	ollamaRoutes := slices.Concat(ollamaBaseRoutes, openAIInferenceRoutes, anthropicInferenceRoutes)
+	openAICompatible, ok := engines.ByName("openai-compatible")
+	if !ok {
+		panic("nvpair-proxy: the shared engine table has no openai-compatible entry")
+	}
+	// The Ollama facade serves two engines: its own, and the user-managed
+	// OpenAI-compatible server riding it. Its OpenAI-dialect inference routes
+	// are granted to both; the native and Anthropic routes stay Ollama's
+	// alone, because the rider speaks neither.
+	ollamaRoutes := slices.Concat(
+		ollamaBaseRoutes,
+		routesServedBy(openAIInferenceRoutes, ollamaFacadeEngines),
+		anthropicInferenceRoutes,
+	)
 	lmStudioRoutes := slices.Concat(lmStudioBaseRoutes, openAIInferenceRoutes, anthropicInferenceRoutes)
 
 	return []engineProfile{
@@ -162,6 +201,13 @@ func buildProfiles() []engineProfile {
 			ModelNaming:           impliedLatestTag,
 			ReservedPersistedPort: 0,
 			SupportsHostAlias:     true,
+			RidingEngines: []engineProfile{
+				{
+					Engine:      openAICompatible,
+					Routes:      slices.Concat(openAICompatibleBaseRoutes, openAIInferenceRoutes),
+					ModelNaming: exactID,
+				},
+			},
 		},
 		{
 			Engine:         lmstudio,
@@ -176,9 +222,34 @@ func buildProfiles() []engineProfile {
 	}
 }
 
-// profileFor resolves the engine named in a facade/enable request.
-func profileFor(name string) (engineProfile, bool) {
+// routesServedBy copies a route table with an explicit engine grant attached.
+// The un-annotated tables stay grant-free (nil = the facade engine alone), so
+// the multi-engine grant is visible at exactly the routes that have one.
+func routesServedBy(routes []route, engines []string) []route {
+	out := make([]route, len(routes))
+	for i, r := range routes {
+		out[i] = route{Path: r.Path, Role: r.Role, Engines: engines}
+	}
+	return out
+}
+
+// allProfiles returns every engine the proxy knows: each facade engine
+// followed by the engines riding it. Riders front no listener, so they never
+// appear in profiles — enableFacade refuses them — but their dialect and
+// naming are first-class through here.
+func allProfiles() []engineProfile {
+	out := make([]engineProfile, 0, len(profiles)+1)
 	for _, p := range profiles {
+		out = append(out, p)
+		out = append(out, p.RidingEngines...)
+	}
+	return out
+}
+
+// profileFor resolves the engine named in a facade/enable request or a
+// node/set-local-backend payload: a facade engine, or one riding a facade.
+func profileFor(name string) (engineProfile, bool) {
+	for _, p := range allProfiles() {
 		if p.Name == name {
 			return p, true
 		}
@@ -195,9 +266,10 @@ func engineNames() string {
 	return strings.Join(names, ", ")
 }
 
-// roleFor classifies a request. The bool reports whether the path is one this
-// engine handles specially; false means forward it verbatim.
-func (p engineProfile) roleFor(method, path string) (routeRole, bool) {
+// routeFor classifies a request and returns the matched route, whose Engines
+// say who may serve it. The bool reports whether the path is one this engine
+// handles specially; false means forward it verbatim.
+func (p engineProfile) routeFor(method, path string) (route, bool) {
 	for _, r := range p.Routes {
 		// Keep scanning on a method mismatch rather than bailing: a path may
 		// legitimately appear twice under different methods, and returning
@@ -206,9 +278,43 @@ func (p engineProfile) roleFor(method, path string) (routeRole, bool) {
 		if r.Path != path || r.Role.method() != method {
 			continue
 		}
-		return r.Role, true
+		return r, true
 	}
-	return 0, false
+	return route{}, false
+}
+
+// roleFor classifies a request. The bool reports whether the path is one this
+// engine handles specially; false means forward it verbatim.
+func (p engineProfile) roleFor(method, path string) (routeRole, bool) {
+	r, ok := p.routeFor(method, path)
+	if !ok {
+		return 0, false
+	}
+	return r.Role, true
+}
+
+// enginesFor resolves the engines a route's grant allows on this facade,
+// facade engine first. An empty grant means the facade engine alone. A grant
+// naming only engines this facade does not host degrades to the facade
+// engine rather than resolving to nothing — a table drift then costs a
+// mis-routed request, not a silently dead route.
+func (p engineProfile) enginesFor(allowed []string) []engineProfile {
+	if len(allowed) == 0 {
+		return []engineProfile{p}
+	}
+	out := make([]engineProfile, 0, len(allowed))
+	if slices.Contains(allowed, p.Name) {
+		out = append(out, p)
+	}
+	for _, rider := range p.RidingEngines {
+		if slices.Contains(allowed, rider.Name) {
+			out = append(out, rider)
+		}
+	}
+	if len(out) == 0 {
+		return []engineProfile{p}
+	}
+	return out
 }
 
 // method is the HTTP method a role applies to.

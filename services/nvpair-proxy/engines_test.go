@@ -3,7 +3,11 @@
 
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"nvpair-shared/engines"
+)
 
 // Routes is a classifier, not an allowlist. handlePlain forwards every
 // loopback path into handleHTTP with no filtering, so a path the table does
@@ -144,7 +148,10 @@ func TestRoleForFindsAPathDeclaredUnderTwoMethods(t *testing.T) {
 // No shipped engine declares the same (path, method) twice; a duplicate would
 // make whichever entry came second dead.
 func TestNoDuplicateRoutePerMethod(t *testing.T) {
-	for _, p := range profiles {
+	// allProfiles, not profiles: a facade-riding engine's route table is
+	// matched by the same routeFor lookup, so a duplicate there would be just
+	// as unreachable as one in a facade's table.
+	for _, p := range allProfiles() {
 		seen := map[string]bool{}
 		for _, r := range p.Routes {
 			key := r.Role.method() + " " + r.Path
@@ -152,6 +159,24 @@ func TestNoDuplicateRoutePerMethod(t *testing.T) {
 				t.Errorf("%s declares %q twice; the second entry is unreachable", p.Name, key)
 			}
 			seen[key] = true
+		}
+	}
+}
+
+// The rider grant is spelled as engine ids and must track the shared table: a
+// rename on either side silently detaches the rider's routes (empty grant
+// filtering) or widens every ollama-native route to it.
+func TestFacadeGrantEnginesExistInTheSharedTable(t *testing.T) {
+	for _, name := range ollamaFacadeEngines {
+		e, ok := engines.ByName(name)
+		if !ok {
+			t.Fatalf("facade grant names engine %q, which the shared table does not define", name)
+		}
+		// The grant is the Ollama facade's two engines: the facade engine
+		// itself, and engines riding it. Anything else in the grant names a
+		// listener this facade cannot reach.
+		if e.Name != "ollama" && e.SharedFacade != "ollama" {
+			t.Errorf("facade grant names %q, which neither owns nor rides the ollama facade (SharedFacade = %q)", name, e.SharedFacade)
 		}
 	}
 }

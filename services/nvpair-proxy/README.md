@@ -17,7 +17,13 @@ socket).
 **One process, one facade per engine.** The process starts with no engine and no
 listener; the broker asks for each engine's facade with `facade/enable`, which
 carries that engine's port and alias addresses. A flag cannot express this,
-because the broker plans a different port for each engine.
+because the broker plans a different port for each engine. An engine declared as
+**riding another engine's facade** (`SharedFacade` in the shared engine table —
+today `openai-compatible` riding `ollama`) is the exception: it gets no facade
+and no listener of its own. Its routes, model naming, and inventory are attached
+to the facade it rides, so one endpoint serves both engines and the model name
+picks the server. `facade/enable` for a riding engine is refused with an
+actionable message naming the facade to enable instead.
 
 They share a process on purpose. Between scheduler snapshots a facade takes
 short-lived reservations for work it has dispatched, and those live in the
@@ -73,7 +79,7 @@ parameter, because one flag cannot carry two engines' plans.
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `engine` | *(required)* | Which engine to front: `ollama` or `lmstudio`. An unknown name is rejected with the accepted values. |
+| `engine` | *(required)* | Which engine to front: `ollama` or `lmstudio`. An unknown name is rejected with the accepted values. An engine that rides another engine's facade — today `openai-compatible` — is refused with a message naming the facade to enable instead. |
 | `port` | per engine, see below | HTTP listen port for request forwarding. Must be 1–65535, or omitted for the engine's standalone default. `0` means "the default" rather than "pick an ephemeral port", and any other out-of-range value is rejected, because the facade announces the requested port in its `ready` notification and the broker would be told `0`. |
 | `aliasAddresses` | *(empty)* | Optional secondary `host:port` values for the same routing handler, one per loopback family so `localhost` resolves either way. Only literal loopback addresses are accepted; the broker uses this for a safe inherited local `OLLAMA_HOST`, and the aliases are not advertised to peers. Accepted only for an engine with an inherited host variable — today Ollama alone — and rejected for any other. |
 | `ignorePersistedPort` | `false` | Use `port` even when a saved port exists (used by broker-managed startup) |
@@ -104,6 +110,23 @@ and the health crash key are matched against each other, so they move together
 | Model-list routes | `GET /api/tags` (native), `GET /v1/models` (OpenAI) | `GET /v1/models` (OpenAI) |
 | Inference routes | `/api/generate`, `/api/chat`, `/api/embeddings`, `/api/embed`, plus the OpenAI and Anthropic Messages sets | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/messages` |
 | Model naming | untagged means `:latest`, so `llama3` and `llama3:latest` are one model | identifiers compared byte for byte |
+
+The `openai-compatible` engine appears in none of those rows because it owns no
+facade. Its routes (the OpenAI inference set plus `GET /v1/models`), its exact
+model ids, and its inventory attach to the **Ollama facade**: one endpoint
+serves both engines, and the model name picks the server. Two consequences are
+worth knowing:
+
+- **Dialect restriction.** A rider-only model has no route on an Ollama-native
+  path (`/api/chat`, `/api/generate`, …) or on Anthropic Messages, so such a
+  request is refused with an actionable local `502` (`engine-dialect-mismatch`)
+  pointing at the OpenAI inference paths on the same port. The refusal is
+  suppressed when the route grant already includes the rider or the model is
+  also advertised by the facade engine.
+- **Collision rule.** When both engines of one node advertise the same model,
+  the facade engine (Ollama) wins everywhere — self-target fan-out, cluster
+  ingress, and merged listings — and listings deduplicate under the calling
+  dialect's convention while keeping each source's verbatim model id.
 
 The route table is a **classifier, not an allowlist**. An unlisted path is
 forwarded verbatim, which is how `/api/show`, `/api/pull`, `/api/ps`,
@@ -173,7 +196,9 @@ One limit is outside the proxy's control: current Chromium-based browsers gate a
   [`nvpair-job-scheduler`](../nvpair-job-scheduler/README.md).
 - **Manual**: `node/select` pins traffic to a specific node. A manual pin
   **overrides the priority list only when that node is eligible** for the
-  requested model.
+  requested model. Manual nodes report only the managed engines' models — a
+  user-managed OpenAI-compatible server on a manual node is not probed, so its
+  models are invisible to routing there.
 - **Failover**: If the selected node disappears from the discovery set, the
   proxy falls back to auto-select and emits `node/selection-changed`. A
   transport error or retryable status, including a model `404` from an
