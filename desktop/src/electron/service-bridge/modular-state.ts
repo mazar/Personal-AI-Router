@@ -56,6 +56,15 @@ export const PROXY_NODE_SOURCES: readonly ProxyNodeSource[] = ['ollama-proxy', '
 export type ProxyEngine = Extract<EngineType, 'ollama' | 'lm-studio'>
 export const PROXY_ENGINES: readonly ProxyEngine[] = ['ollama', 'lm-studio']
 
+/**
+ * Engines whose state a remote peer reports: the proxy engines plus the
+ * facade-riding engine. The rider has no facade of its own and is never
+ * remotely started or stopped — PAIR neither installs nor spawns it — so it is
+ * status-and-models only, and its models ride the facade engine's
+ * advertisement.
+ */
+const REMOTE_ENGINES: readonly EngineType[] = [...PROXY_ENGINES, 'openai-compatible']
+
 /** Map a proxy node source onto the engine it describes. */
 const PROXY_SOURCE_ENGINE: Record<ProxyNodeSource, ProxyEngine> = {
     'ollama-proxy': 'ollama',
@@ -1145,13 +1154,14 @@ class ModularBridgeState {
             }
         }
 
-        // Remote nodes: per proxy-engine status + models from discovery. Status
-        // prefers the authoritative `engine:remote-get-installed` facts (mTLS)
-        // over the inferred presence, and is omitted entirely when neither is
-        // known — see {@link resolveRemoteEngineStatus}.
+        // Remote nodes: per-engine status + models from discovery, for every
+        // engine a peer reports — the proxy engines and the facade-riding one.
+        // Status prefers the authoritative `engine:remote-get-installed` facts
+        // (mTLS) over the inferred presence, and is omitted entirely when
+        // neither is known — see {@link resolveRemoteEngineStatus}.
         for (const node of Array.from(this.nodes.values())) {
             if (node.id === selfId) continue
-            for (const engine of PROXY_ENGINES) {
+            for (const engine of REMOTE_ENGINES) {
                 const status = this.resolveRemoteEngineStatus(node.id, engine)
                 if (status) statuses.push(status)
                 models.push(this.toEngineModels(node, engine))
@@ -1666,7 +1676,6 @@ class ModularBridgeState {
     }
 
     private emitRemoteEngineStatus(nodeId: string, engineType: EngineType): void {
-        if (!isProxyEngine(engineType)) return
         if (!this.nodes.has(nodeId)) return
         // Re-emit models alongside status: authoritative facts arriving here can
         // flip which engine is the single active one, which changes model
@@ -1687,7 +1696,7 @@ class ModularBridgeState {
      * placeholder when nothing is known so stale inferred state is cleared
      * without asserting installed-but-off.
      */
-    private remoteEngineStatusForPush(nodeId: string, engine: ProxyEngine): EngineStatusData {
+    private remoteEngineStatusForPush(nodeId: string, engine: EngineType): EngineStatusData {
         const status = this.resolveRemoteEngineStatus(nodeId, engine)
         return status ?? emptyEngineStatus(nodeId, engine)
     }
@@ -1723,12 +1732,23 @@ class ModularBridgeState {
      * The peer's engine port stays private (loopback) and comes only from facts;
      * the LOCAL proxy port is never attributed to a peer.
      */
-    private resolveRemoteEngineStatus(
-        nodeId: string,
-        engine: ProxyEngine
-    ): EngineStatusData | null {
+    /**
+     * The discovery presence an engine's remote status reads its promoted
+     * proxy port and version from. A facade-riding engine owns no
+     * advertisement: its endpoint is the facade engine's (`openai-compatible`
+     * rides Ollama's facade), so it reads that engine's presence.
+     */
+    private remotePresenceFor(
+        node: ModularNode | undefined,
+        engine: EngineType
+    ): EnginePresence | undefined {
+        if (engine === 'openai-compatible') return node?.engines.ollama
+        return node?.engines[engine]
+    }
+
+    private resolveRemoteEngineStatus(nodeId: string, engine: EngineType): EngineStatusData | null {
         const node = this.nodes.get(nodeId)
-        const presence = node?.engines[engine]
+        const presence = this.remotePresenceFor(node, engine)
         const facts = this.remoteEngineFacts.get(this.remoteOpKey(nodeId, engine))
         const pending = this.pendingRemoteEngineOps.get(this.remoteOpKey(nodeId, engine))
 
@@ -1749,16 +1769,29 @@ class ModularBridgeState {
                 // The peer's promoted proxy port, when its engine is advertised.
                 proxyPort: presence?.up && presence.port > 0 ? presence.port : null
             }
-        } else if (node && presence?.up && !node.clustered && !node.trusted) {
+        } else if (
+            engine !== 'openai-compatible' &&
+            node &&
+            presence?.up &&
+            !node.clustered &&
+            !node.trusted
+        ) {
             // A live advertisement means the engine is reachable and serving, so
             // `running` is sound even without facts — for an unclustered peer that
             // cannot be polled over ec. Clustered / pinned members must wait for
             // `engine:remote-get-installed` facts so a routable proxy overlay does
             // not masquerade as install/run truth (and cannot distinguish stopped
-            // from not-installed).
+            // from not-installed). The facade-riding engine gets no such
+            // inference: the presence read here is the facade engine's, which
+            // cannot tell whether the rider is the one up — only facts may
+            // assert its state.
             base = toEngineStatus(node, engine, null)
         }
-        if (base && presence?.version) base.installedVersion = presence.version
+        // The facade engine's version is not the rider's: a facade-riding
+        // engine is versioned only by its own facts.
+        if (base && engine !== 'openai-compatible' && presence?.version) {
+            base.installedVersion = presence.version
+        }
 
         if (!pending) return base
         // A user-initiated remote op shows its optimistic status even while the
@@ -1777,19 +1810,21 @@ class ModularBridgeState {
     /**
      * Apply a peer's full `engine:remote-get-installed` response
      * (`{ engines: EngineStatus[] }` from its `ec` `/v1/engines`). Stores facts
-     * for each proxy engine and re-emits status so installed/running/port reflect
-     * the peer's own truth rather than inferred presence.
+     * for each reported engine — the proxy engines and the facade-riding one,
+     * whose peer engine-manager reports it like any other — and re-emits status
+     * so installed/running/port reflect the peer's own truth rather than
+     * inferred presence.
      */
     applyRemoteEngineFacts(nodeId: string, result: JsonValue | undefined): void {
         const obj = objectValue(result)
         const list = obj?.engines
         if (!Array.isArray(list)) return
-        const seen = new Set<ProxyEngine>()
+        const seen = new Set<EngineType>()
         for (const entry of list) {
             const engineObj = objectValue(entry)
             if (!engineObj) continue
             const engineType = engineTypeFromManagerName(stringValue(engineObj.engine))
-            if (!engineType || !isProxyEngine(engineType)) continue
+            if (!engineType) continue
             this.remoteEngineFacts.set(this.remoteOpKey(nodeId, engineType), {
                 installed: booleanValue(engineObj.installed),
                 running: booleanValue(engineObj.running),
@@ -1798,7 +1833,7 @@ class ModularBridgeState {
             })
             seen.add(engineType)
         }
-        for (const engine of PROXY_ENGINES) {
+        for (const engine of REMOTE_ENGINES) {
             if (!seen.has(engine)) {
                 this.remoteEngineFacts.delete(this.remoteOpKey(nodeId, engine))
             }
@@ -1830,7 +1865,7 @@ class ModularBridgeState {
 
     /** Forget a node's authoritative remote-engine facts (on eviction/leave). */
     private dropRemoteEngineFacts(nodeId: string): void {
-        for (const engine of PROXY_ENGINES) {
+        for (const engine of REMOTE_ENGINES) {
             this.remoteEngineFacts.delete(this.remoteOpKey(nodeId, engine))
             this.remotePullModels.delete(this.remoteOpKey(nodeId, engine))
         }
@@ -1981,7 +2016,7 @@ class ModularBridgeState {
      * cross-attributed when both run). Mirrors
      * noderec.DirectoryNode.EngineModels.
      */
-    private modelsForEngine(node: ModularNode, engine: ProxyEngine): string[] {
+    private modelsForEngine(node: ModularNode, engine: EngineType): string[] {
         // Per-engine attribution is authoritative when the node carries any:
         // return exactly this engine's models so a dual-engine node attributes
         // each model to the engine that serves it, and a missing key means this
@@ -1992,14 +2027,17 @@ class ModularBridgeState {
         }
         // Fallback for a pre-attribution peer: the flat union is unattributed, so
         // attribute it only when exactly one proxy engine is active on the node,
-        // and never cross-attribute when both run.
+        // and never cross-attribute when both run. A facade-riding engine never
+        // claims the flat list: a peer without attribution predates per-engine
+        // attribution, and its flat list belongs to the facade engines.
+        if (engine === 'openai-compatible') return []
         const active = PROXY_ENGINES.filter(candidate =>
             this.engineActiveForModels(node, candidate)
         )
         return active.length === 1 && active[0] === engine ? node.models : []
     }
 
-    private toEngineModels(node: ModularNode, engine: ProxyEngine): EngineModels {
+    private toEngineModels(node: ModularNode, engine: EngineType): EngineModels {
         const loaded = loadedNamesForEngine(node, engine)
         return {
             engineType: engine,
@@ -2027,7 +2065,7 @@ class ModularBridgeState {
      */
     private discoveryModelsForNode(
         node: ModularNode | undefined,
-        engine: ProxyEngine,
+        engine: EngineType,
         nodeId: string
     ): EngineModels {
         if (nodeId === this.selfId) {
