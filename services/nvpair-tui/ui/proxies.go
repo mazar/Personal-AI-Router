@@ -27,11 +27,17 @@ type proxyNode struct {
 
 // buildProxyEngines makes one tab per engine, in the shared table's order, so
 // an engine added there appears here rather than being silently absent from
-// this view.
+// this view. Facade-riding engines are skipped: they front no listener of
+// their own, their relay prefix resolves onto the facade they ride, and a tab
+// would show that facade's status twice while offering a port edit on a
+// process that owns nothing.
 func buildProxyEngines() []*proxyEngine {
 	all := engines.All()
 	out := make([]*proxyEngine, 0, len(all))
 	for _, e := range all {
+		if e.SharedFacade != "" {
+			continue
+		}
 		out = append(out, &proxyEngine{label: e.DisplayName, prefix: e.ComponentName(), table: newTable(nil)})
 	}
 	return out

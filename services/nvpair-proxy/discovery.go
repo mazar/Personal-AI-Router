@@ -41,6 +41,14 @@ type Node struct {
 	// advertises the requested model; an empty list stays in discovery but is
 	// not an inference candidate until a later inventory update.
 	Models []string `json:"models,omitempty"`
+	// ModelsByEngine attributes that inventory per engine: the facade engine's
+	// list, plus each facade-riding engine's own. nodeAdvertisesModel matches
+	// against it per engine, so a model a node serves only through its
+	// OpenAI-compatible server routes to that engine and not to the facade
+	// engine. Internal routing metadata like ClusterUUID, not part of the
+	// outward node contract — Models keeps the facade engine's list for
+	// display.
+	ModelsByEngine map[string][]string `json:"-"`
 	// IP is the single canonical LAN address a consumer should dial/display for
 	// this node, resolved via the shared netpick ranker: the node's
 	// own ip= TXT if present, else the best-scored advertised IPv4. It is

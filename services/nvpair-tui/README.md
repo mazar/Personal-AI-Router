@@ -32,7 +32,7 @@ Tabs:
 | **Nodes** | mDNS-discovered Ollama nodes (`discovery:subscribe` / `discovery:nodes-changed`). |
 | **Proxies** | Ollama and LM Studio reverse proxies: status, discovered upstreams, select a node (`enter`/`a`), set the listen port (`p`). |
 | **Workloads** | Live cluster workloads (`workloads:subscribe` / `workloads:upsert` / `workloads:remove`). |
-| **Engines** | Local inference engines: install (`i`), start (`s`), stop (`x`), restart (`r`), uninstall (`u`). |
+| **Engines** | Local inference engines: install (`i`), start (`s`), stop (`x`), restart (`r`), uninstall (`u`), set the server's port (`e`) — for the user-managed OpenAI-compatible server that is the only control: PAIR never starts or stops it, and pointing PAIR at its port is what makes its models appear. |
 | **Cluster** | Pairing + membership: invite by address (`i`, shows the six-digit PIN — the first invite auto-founds a cluster of one), accept (`a`) / decline (`d`) an inbound invite, remove a member (`r`), leave (`L`). |
 | **Manual** | User-added nodes: add by address (`a`), remove (`r`). |
 | **Settings** | The node-settings store (force-ports, cluster auto-sync, cluster id/name). |

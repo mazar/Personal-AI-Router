@@ -21,7 +21,14 @@ func TestEngineProxyTableMatchesSharedEngines(t *testing.T) {
 		t.Fatalf("first profile = %q, want ollama prepared first", got)
 	}
 	for _, p := range engineProxyProfiles {
-		if p.FacadePort == p.EnginePortBase {
+		if p.SharedFacade != "" {
+			// A facade-riding engine claims no ports: both are zero by design,
+			// and its facade is another entry's port. Everything else about it
+			// must still hold.
+			if p.FacadePort != 0 || p.EnginePortBase != 0 || p.PortFile != "" {
+				t.Errorf("%s: a facade-riding engine must claim no ports", p.Name)
+			}
+		} else if p.FacadePort == p.EnginePortBase {
 			t.Errorf("%s: facade and backend base are both %d; the proxy and engine would collide",
 				p.Name, p.FacadePort)
 		}
@@ -46,6 +53,7 @@ func TestEngineHealthProbePaths(t *testing.T) {
 	}{
 		{"ollama", "/"},
 		{"lmstudio", "/v1/models"},
+		{"openai-compatible", "/v1/models"},
 	} {
 		p, ok := engineProxyProfileFor(tc.engine)
 		if !ok {
@@ -92,8 +100,8 @@ func TestBrokerConstantsMatchTheEngineTable(t *testing.T) {
 	}
 }
 
-// Ownership is the one judgment call in adding an engine, so the two values in
-// the table today are pinned explicitly. Getting these backwards does not fail
+// Ownership is the one judgment call in adding an engine, so the values in the
+// table today are pinned explicitly. Getting these backwards does not fail
 // to compile — it silently changes which engine the broker believes it may stop.
 func TestEngineOwnershipAssignments(t *testing.T) {
 	for _, tc := range []struct {
@@ -102,6 +110,7 @@ func TestEngineOwnershipAssignments(t *testing.T) {
 	}{
 		{"ollama", adoptedEngine},
 		{"lmstudio", managedEngine},
+		{"openai-compatible", externalEngine},
 	} {
 		p, ok := engineProxyProfileFor(tc.engine)
 		if !ok {
@@ -209,10 +218,24 @@ func TestProxyEnabledHonorsSelectionAndBinary(t *testing.T) {
 	if b.proxyEnabled(lmstudioProxyProfile) {
 		t.Error("lmstudio was not selected but is enabled")
 	}
+	// A facade-riding engine is fronted with the facade it rides, not by its
+	// own selection: naming it without its facade engine must not promise an
+	// endpoint nobody hosts.
+	if !b.proxyEnabled(openAICompatibleProxyProfile) {
+		t.Error("the rider must be fronted whenever its facade engine is")
+	}
+
+	b = &Broker{proxyPath: "/path/to/nvpair-proxy", proxyEngines: []string{"lmstudio", "openai-compatible"}}
+	if b.proxyEnabled(openAICompatibleProxyProfile) {
+		t.Error("the rider was selected without its facade engine, but is enabled")
+	}
 
 	b = &Broker{proxyEngines: []string{"ollama", "lmstudio"}}
 	if b.proxyEnabled(ollamaProxyProfile) {
 		t.Error("no proxy binary resolved, but the engine is enabled")
+	}
+	if b.proxyEnabled(openAICompatibleProxyProfile) {
+		t.Error("no proxy binary resolved, but the rider is enabled")
 	}
 }
 
@@ -285,6 +308,12 @@ func TestDeselectedEngineIsNotPrepared(t *testing.T) {
 // occupied facade matters.
 func TestAStrangerOnTheFacadeBlocksEveryEngine(t *testing.T) {
 	for _, p := range engineProxyProfiles {
+		if p.SharedFacade != "" {
+			// A facade-riding engine is never port-planned at all — it owns
+			// no facade, so there is no occupied port to reason about. (Its
+			// zero facade port would otherwise make this pass by accident.)
+			continue
+		}
 		t.Run(p.Name, func(t *testing.T) {
 			// The engine is stopped somewhere else entirely, so whoever holds
 			// the facade is not it.

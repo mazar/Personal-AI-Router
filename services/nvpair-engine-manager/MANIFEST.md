@@ -149,7 +149,7 @@ and recovery. Editing `args`/`start` directly remains trusted manifest authoring
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `mode` | string | no | `"process"` (default) — the engine is a foreground process this service spawns and **owns** (liveness = process alive) — or `"command"` — a daemon driven by start/stop commands (liveness = the probe). |
+| `mode` | string | no | `"process"` (default) — the engine is a foreground process this service spawns and **owns** (liveness = process alive) — `"command"` — a daemon driven by start/stop commands (liveness = the probe) — or `"external"` — a **user-managed** server this service never spawns, moves or stops: PAIR only probes the configured `port` and reports it running while the probe answers. Requires `port > 0` and a `ready` probe; `start` refuses with the user-managed reason while nothing answers, and a port change re-probes without touching any process. |
 | `bin` | string | process mode | Path to the engine binary (required in `process` mode). Placeholders + OS env refs resolved. |
 | `args` | string[] | no | Arguments (process mode). |
 | `env` | object | no | Extra environment (merged over the inherited env). Use `{host}`/`{port}` for the listen address, e.g. `"OLLAMA_HOST": "{host}:{port}"`. |

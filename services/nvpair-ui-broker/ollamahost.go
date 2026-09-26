@@ -366,6 +366,11 @@ func (b *Broker) siblingEngineProxyPorts(self engineProxyProfile) map[int]string
 		if p.Name == self.Name {
 			continue
 		}
+		if p.SharedFacade != "" {
+			// A facade-riding engine claims no ports of its own — its facade
+			// port is the facade engine's, which its own entry reserves.
+			continue
+		}
 		suffix := ""
 		if !b.proxyEnabled(p) {
 			suffix = " (its proxy is not enabled, but the port stays reserved)"

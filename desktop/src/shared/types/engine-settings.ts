@@ -34,6 +34,8 @@ export interface EngineSettingsSnapshot extends EngineSettingsTarget {
     running: boolean
     adopted: boolean
     editable: boolean
+    /** True for a user-managed engine: PAIR never launches it; only the server port is editable. */
+    external: boolean
     reason: string
     format: string
     phase: 'idle' | 'applying' | 'succeeded' | 'failed'

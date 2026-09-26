@@ -9,34 +9,42 @@ import { EngineType, ModelExpiry } from '@/shared/types/engines'
 // never-enabled placeholders; they were removed with the chat window, which was
 // their only in-app consumer. Adding an engine back means shipping its manifest
 // first -- an engine row without one renders commands that fail with `-32000`.
-export const EngineTypes = ['ollama', 'lm-studio'] as const
+export const EngineTypes = ['ollama', 'lm-studio', 'openai-compatible'] as const
 
 // Kept as a distinct export so a future engine can ship behind it rather than
 // appearing the moment its type exists.
-export const EnabledEngineTypes: EngineType[] = ['ollama', 'lm-studio'] as const
+export const EnabledEngineTypes: EngineType[] = ['ollama', 'lm-studio', 'openai-compatible']
 
 /**
  * How `nvpair-engine-manager` spells each engine on the wire. Only LM Studio
  * differs from PAIR's `EngineType`; every other engine is identical on both
- * sides. This is the single translation table — use `engineManagerName()` and
+ * sides -- including the OpenAI-compatible server, which shipped with one
+ * spelling on both sides of the bridge and so maps to itself. This is the
+ * single translation table — use `engineManagerName()` and
  * `engineTypeFromManagerName()` rather than re-deriving it from a literal.
  */
 export const EngineManagerNames = {
     ollama: 'ollama',
-    'lm-studio': 'lmstudio'
+    'lm-studio': 'lmstudio',
+    'openai-compatible': 'openai-compatible'
 } as const satisfies Record<EngineType, string>
 
 export const EngineSources = ['bundled', 'detected', 'installed'] as const
 
 export const EngineDisplayNames: Record<EngineType, string> = {
     ollama: 'Ollama',
-    'lm-studio': 'LM Studio'
+    'lm-studio': 'LM Studio',
+    'openai-compatible': 'OpenAI-compatible server'
 } as const
 
 /** Default docs/install URLs for built-in backends. Single source of truth for UI and adapter buildInfo(). */
 export const EngineDefaultLinks: Record<EngineType, { docsUrl: string; installUrl: string }> = {
     ollama: { docsUrl: 'https://docs.ollama.com/', installUrl: 'https://ollama.com/download' },
-    'lm-studio': { docsUrl: 'https://lmstudio.ai/docs', installUrl: 'https://lmstudio.ai/' }
+    'lm-studio': { docsUrl: 'https://lmstudio.ai/docs', installUrl: 'https://lmstudio.ai/' },
+    // The user runs this engine themselves (vLLM, SGLang, llama.cpp's server,
+    // ...), so its "install" link is the category's documentation rather than a
+    // download PAIR would perform.
+    'openai-compatible': { docsUrl: 'https://docs.vllm.ai/', installUrl: 'https://docs.vllm.ai/' }
 } as const
 
 export const ModelItemStatuses = ['idle', 'loading', 'loaded', 'ejecting', 'pulling'] as const

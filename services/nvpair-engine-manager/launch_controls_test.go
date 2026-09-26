@@ -109,7 +109,7 @@ func TestSavedControlsCannotBypassLaunchValidation(t *testing.T) {
 func TestBundledNetworkingControls(t *testing.T) {
 	reg := loadWithOverrides(t, t.TempDir())
 	// Adding a bundled engine requires an explicit networking review and cases.
-	wantEngines := []string{"lmstudio", "ollama"}
+	wantEngines := []string{"lmstudio", "ollama", "openai-compatible"}
 	names := reg.Names()
 	slices.Sort(names)
 	if !slices.Equal(names, wantEngines) {
@@ -117,6 +117,18 @@ func TestBundledNetworkingControls(t *testing.T) {
 	}
 	for _, name := range names {
 		manifest, _ := reg.Get(name)
+		if name == "openai-compatible" {
+			// Review conclusion: a user-managed engine declares no launch at
+			// all. PAIR never spawns it, so there are no controls to bind —
+			// its bind address and CORS policy are entirely the user's own
+			// configuration, and PAIR only probes and routes to the port.
+			for platform, config := range manifest.Platforms {
+				if config.Runtime.EditableLaunch != nil || config.Runtime.LaunchArgs != nil || config.Runtime.LaunchEnv != nil || config.Runtime.Bin != "" || len(config.Runtime.Start) > 0 {
+					t.Fatalf("platform %q: openai-compatible must declare no launch configuration", platform)
+				}
+			}
+			continue
+		}
 		for platform, config := range manifest.Platforms {
 			t.Run(name+"/"+platform, func(t *testing.T) {
 				e := settingsExecutor(t, config.Runtime.modeOrDefault() == "command")

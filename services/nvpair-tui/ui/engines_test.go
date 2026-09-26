@@ -29,3 +29,18 @@ func TestPullParamsSendsBothKeys(t *testing.T) {
 		t.Fatalf(`params["model"] = %q, want "owner/model" (LM Studio reads this key)`, inner["model"])
 	}
 }
+
+// TestPortParamsCarriesTheEngine guards the set-server-port params: the
+// broker's engine:set-port takes the engine from the params (only the
+// proxy-scoped set-ports hardcode their engine), so a payload without it
+// would re-port whichever engine the worker defaulted to.
+func TestPortParamsCarriesTheEngine(t *testing.T) {
+	p := portParams("openai-compatible", 8888)
+
+	if p["engine"] != "openai-compatible" {
+		t.Fatalf("engine = %v, want openai-compatible", p["engine"])
+	}
+	if p["port"] != 8888 {
+		t.Fatalf("port = %v, want 8888", p["port"])
+	}
+}

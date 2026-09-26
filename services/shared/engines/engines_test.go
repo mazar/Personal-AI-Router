@@ -23,7 +23,7 @@ func TestOllamaIsPreparedFirst(t *testing.T) {
 
 func TestNames(t *testing.T) {
 	got := Names()
-	want := []string{"ollama", "lmstudio"}
+	want := []string{"ollama", "lmstudio", "openai-compatible"}
 	if len(got) != len(want) {
 		t.Fatalf("Names() = %v, want %v", got, want)
 	}
@@ -66,9 +66,24 @@ func TestProxyIdentities(t *testing.T) {
 
 // TestFacadeAndEnginePortsDiffer guards the invariant that makes managed mode
 // coherent: the proxy claims the engine's stock port, so the engine has to move
-// somewhere else.
+// somewhere else. A facade-riding engine owns no listener at all, so the same
+// test pins the reverse for it: zero ports, and a SharedFacade naming an
+// existing facade-owning engine.
 func TestFacadeAndEnginePortsDiffer(t *testing.T) {
 	for _, e := range All() {
+		if e.SharedFacade != "" {
+			if e.FacadePort != 0 || e.EnginePortBase != 0 {
+				t.Errorf("%s rides the %s facade but declares ports facade=%d base=%d; a riding engine owns no listener",
+					e.Name, e.SharedFacade, e.FacadePort, e.EnginePortBase)
+			}
+			facade, ok := ByName(e.SharedFacade)
+			if !ok {
+				t.Errorf("%s rides %q, which is not in the shared table", e.Name, e.SharedFacade)
+			} else if facade.SharedFacade != "" {
+				t.Errorf("%s rides %q, which rides a facade itself", e.Name, e.SharedFacade)
+			}
+			continue
+		}
 		if e.FacadePort == e.EnginePortBase {
 			t.Errorf("%s: FacadePort and EnginePortBase are both %d; the engine has nowhere to move",
 				e.Name, e.FacadePort)
@@ -97,6 +112,16 @@ func TestPortFilesAreDeclaredNotDerived(t *testing.T) {
 		t.Errorf("ollama PortFile now matches the derived name %q; existing installs would be orphaned", derived)
 	}
 	for _, e := range All() {
+		// A facade-riding engine persists no proxy port of its own — its proxy
+		// port is the facade it rides — so an empty PortFile is the invariant,
+		// not a gap.
+		if e.SharedFacade != "" {
+			if e.PortFile != "" {
+				t.Errorf("%s rides the %s facade but declares PortFile %q; a riding engine persists no port",
+					e.Name, e.SharedFacade, e.PortFile)
+			}
+			continue
+		}
 		if e.PortFile == "" {
 			t.Errorf("%s has no PortFile; its proxy would persist nothing", e.Name)
 		}
@@ -110,7 +135,12 @@ func TestIdentitiesAreUnique(t *testing.T) {
 	facades := map[int]bool{}
 
 	for _, e := range All() {
-		if e.Name == "" || e.DisplayName == "" || e.PortFile == "" || e.DiscoveryService == "" {
+		// A facade-riding engine never registers under its DiscoveryService —
+		// it deliberately shares the facade engine's key — and owns no facade
+		// port, so those two uniqueness checks and the PortFile requirement
+		// apply to facade-owning engines only.
+		facadeOwning := e.SharedFacade == ""
+		if e.Name == "" || e.DisplayName == "" || e.DiscoveryService == "" || (facadeOwning && e.PortFile == "") {
 			t.Errorf("%+v: every identity field must be set", e)
 		}
 		if names[e.Name] {
@@ -119,16 +149,18 @@ func TestIdentitiesAreUnique(t *testing.T) {
 		if components[e.ComponentName()] {
 			t.Errorf("duplicate ComponentName %q", e.ComponentName())
 		}
-		if services[e.DiscoveryService] {
-			t.Errorf("duplicate DiscoveryService %q", e.DiscoveryService)
-		}
-		if facades[e.FacadePort] {
-			t.Errorf("duplicate FacadePort %d", e.FacadePort)
+		if facadeOwning {
+			if services[e.DiscoveryService] {
+				t.Errorf("duplicate DiscoveryService %q", e.DiscoveryService)
+			}
+			if facades[e.FacadePort] {
+				t.Errorf("duplicate FacadePort %d", e.FacadePort)
+			}
+			services[e.DiscoveryService] = true
+			facades[e.FacadePort] = true
 		}
 		names[e.Name] = true
 		components[e.ComponentName()] = true
-		services[e.DiscoveryService] = true
-		facades[e.FacadePort] = true
 	}
 }
 

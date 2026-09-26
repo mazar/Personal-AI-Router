@@ -120,7 +120,16 @@ func launchForState(st *engineState, port int) (launchCommand, error) {
 func (e *Executor) launchStateLocked(engine string, st *engineState) settings.LaunchState {
 	st.mu.Lock()
 	result := settings.LaunchState{Engine: engine, ServerPort: st.plat.Runtime.Port, EffectivePort: st.port, Running: st.running, Adopted: st.adopted, Format: launchTextFormat}
+	external := st.plat.Runtime.modeOrDefault() == "external"
 	st.mu.Unlock()
+	if external {
+		// A user-managed engine has no launch for PAIR to display or edit: the
+		// user runs and configures it in its own application. PAIR only routes
+		// to the server port above.
+		result.External = true
+		result.Reason = "This engine is user-managed: run and configure it in its own application. PAIR only routes to the server port."
+		return result
+	}
 	command, err := launchForState(st, result.ServerPort)
 	if err == nil {
 		result.LaunchText, err = command.argumentText(st.plat.Runtime.EditableLaunch)
@@ -246,6 +255,13 @@ func (e *Executor) previewLaunchLocked(st *engineState, request settings.Request
 		return result
 	}
 	rt := st.plat.Runtime
+	if rt.modeOrDefault() == "external" {
+		// A user-managed engine has no launch for PAIR to edit. Only the server
+		// port is meaningful: it is where PAIR probes and routes. No restart —
+		// there is no PAIR-owned process to bounce.
+		result.Settings.LaunchText = ""
+		return result
+	}
 	policy := rt.EditableLaunch
 	if policy == nil {
 		return fail("This engine does not support launch settings.")
@@ -401,6 +417,26 @@ func (e *Executor) ConfigureLaunch(ctx context.Context, p settings.Configure, re
 	e.reporter.clear(startFailedID(p.Engine))
 	e.reporter.clear(exitedID(p.Engine))
 	old := e.launchStateLocked(p.Engine, st)
+	if old.External {
+		// Port-only apply for a user-managed engine: persist where PAIR probes
+		// and routes, and reconcile. There is no process to bounce and no
+		// launch text to store, and a failed apply must not touch the user's
+		// server, so nothing is stopped first.
+		if err := e.persistPort(p.Engine, preview.Settings.ServerPort); err != nil {
+			return e.launchStateLocked(p.Engine, st), err
+		}
+		st.mu.Lock()
+		st.plat.Runtime.Port = preview.Settings.ServerPort
+		st.port = preview.Settings.ServerPort
+		st.mu.Unlock()
+		pathInstalled, _ := e.Detect(p.Engine)
+		e.reconcilePresence(ctx, p.Engine, st, pathInstalled, preview.Settings.ServerPort, false)
+		// No rebind: a user-managed engine owns no PAIR proxy port, so there
+		// is no facade for the parent to move. The rebind callback exists to
+		// apply a changed proxy port, which external engines never have.
+		e.emitState(p.Engine)
+		return e.launchStateLocked(p.Engine, st), nil
+	}
 	changed := old.ServerPort != preview.Settings.ServerPort || old.LaunchText != preview.Settings.LaunchText
 	// Stop before writing the override file. A stop failure returns with the
 	// engine still on its old launch, so persisting first would leave disk on

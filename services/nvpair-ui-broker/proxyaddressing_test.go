@@ -57,6 +57,15 @@ func TestRelayAddressesTheMethodItSendsDownward(t *testing.T) {
 
 			b := &Broker{codec: NewCodec(rwDiscard{})}
 			b.setEngineProxyHandle(profile, proxy)
+			if profile.SharedFacade != "" {
+				// One process hosts every facade, and spawnProxy publishes it
+				// under each enabled profile — the rider included. The relay
+				// resolves the rider to its facade, so the handle must be
+				// reachable under the facade engine's name too.
+				if facade, ok := engineProxyProfileFor(profile.SharedFacade); ok {
+					b.setEngineProxyHandle(facade, proxy)
+				}
+			}
 
 			id := json.RawMessage(`1`)
 			b.relayToEngineProxy(profile, &Message{
@@ -66,7 +75,17 @@ func TestRelayAddressesTheMethodItSendsDownward(t *testing.T) {
 
 			select {
 			case got := <-seen:
+				// A facade-riding engine is relayed to the facade it rides:
+				// the client prefix names the rider, the wire address names
+				// the facade engine whose listener actually serves it.
 				want := profile.addressed("nodes/list")
+				if profile.SharedFacade != "" {
+					facade, ok := engineProxyProfileFor(profile.SharedFacade)
+					if !ok {
+						t.Fatalf("no facade profile for %q", profile.SharedFacade)
+					}
+					want = facade.addressed("nodes/list")
+				}
 				if got != want {
 					t.Fatalf("relayed method = %q, want %q", got, want)
 				}

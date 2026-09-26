@@ -78,13 +78,15 @@ type facade struct {
 	selectedMu sync.RWMutex
 	selectedID string
 
-	// backendMu guards backend, the explicit loopback engine this facade's
-	// cluster mTLS ingress forwards to. The broker sets/clears it via
-	// node/set-local-backend; it is never sourced from discovery, so an ingress
-	// request can only ever reach this node's own local engine and can never be
-	// re-routed to a peer.
+	// backendMu guards backends, the explicit loopback engines this facade's
+	// cluster mTLS ingress and self-candidates forward to, keyed by engine id:
+	// the facade engine itself, plus any facade-riding engine whose models
+	// share this listener. The broker sets/clears entries via
+	// node/set-local-backend; they are never sourced from discovery, so an
+	// ingress request can only ever reach this node's own local engines and
+	// can never be re-routed to a peer.
 	backendMu sync.RWMutex
-	backend   localBackend
+	backends  map[string]localBackend
 
 	// targets remembers, per node, which of its published addresses accepted a
 	// connection, so a repeated forward costs no confirmation. An entry is
@@ -170,6 +172,16 @@ func (p *Proxy) enableFacade(params enableFacadeParams) (enableFacadeResult, err
 	profile, ok := profileFor(params.Engine)
 	if !ok {
 		return enableFacadeResult{}, fmt.Errorf("unknown engine %q; want one of %s", params.Engine, engineNames())
+	}
+	// A facade-riding engine owns no listener: its models are served through
+	// the facade of the engine it rides, so bringing it up would bind a
+	// listener no client address points at. Name the engine whose facade
+	// carries it rather than failing with "unknown engine" — the broker plans
+	// one facade per engine and has to tell a typo apart from a rider.
+	if profile.SharedFacade != "" {
+		return enableFacadeResult{}, fmt.Errorf(
+			"engine %q has no facade of its own: it is served through the %s facade, so enable %q instead",
+			profile.Name, profile.SharedFacade, profile.SharedFacade)
 	}
 	if params.Port != 0 && (params.Port < 1 || params.Port > 65535) {
 		// Zero means "the standalone default", so it is the one out-of-range

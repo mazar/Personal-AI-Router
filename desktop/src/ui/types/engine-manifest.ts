@@ -47,4 +47,11 @@ export interface EngineCaps {
      * hub config here. Presence doubles as the truthy flag for the hub source selector.
      */
     engineHub?: EngineHubConfig
+    /**
+     * When true, the engine is user-managed: PAIR never installs, starts,
+     * stops or deletes anything for it, and every control that would do so is
+     * withheld. The UI surfaces health and models only, plus the advisory
+     * server port the user points PAIR at.
+     */
+    userManaged: boolean
 }

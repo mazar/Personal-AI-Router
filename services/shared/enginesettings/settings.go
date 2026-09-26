@@ -39,11 +39,15 @@ type Snapshot struct {
 	Running             bool   `json:"running"`
 	Adopted             bool   `json:"adopted"`
 	Editable            bool   `json:"editable"`
-	Reason              string `json:"reason,omitempty"`
-	Format              string `json:"format"`
-	Phase               string `json:"phase"`
-	Error               string `json:"error,omitempty"`
-	RequestID           string `json:"requestId,omitempty"`
+	// External marks a user-managed engine PAIR never launches: settings are
+	// advisory, Editable is false for launch content, only ServerPort may be
+	// applied, and LaunchText is empty.
+	External  bool   `json:"external,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+	Format    string `json:"format"`
+	Phase     string `json:"phase"`
+	Error     string `json:"error,omitempty"`
+	RequestID string `json:"requestId,omitempty"`
 }
 
 type Conflict struct {
@@ -73,8 +77,11 @@ type LaunchState struct {
 	Running       bool   `json:"running"`
 	Adopted       bool   `json:"adopted"`
 	Editable      bool   `json:"editable"`
-	Reason        string `json:"reason,omitempty"`
-	Format        string `json:"format"`
+	// External marks a user-managed engine PAIR never launches; see
+	// Snapshot.External.
+	External bool   `json:"external,omitempty"`
+	Reason   string `json:"reason,omitempty"`
+	Format   string `json:"format"`
 }
 
 type Configure struct {

@@ -102,6 +102,14 @@ Ollama's managed facade wants `:11434` while LM Studio's wants `:1234`, and
 either may be absent so the child keeps its own persisted port — and a
 single-valued flag carries only one plan.
 
+An engine marked as **riding another engine's facade** (`SharedFacade` in the
+shared engine table) is planned differently: the broker sends no `facade/enable`
+for it at all. Its route table, model naming, and inventory are attached to the
+facade it rides when that facade is enabled, so its models are served through
+the same listener and the model name decides which local backend receives the
+request. Enabling a riding engine directly is refused with a message naming the
+facade to enable instead.
+
 ### 3.1 Why one process
 
 Between scheduler snapshots a facade takes short-lived **reservations** for work
@@ -163,7 +171,10 @@ For a model-bearing inference request:
 
 1. Filter a request-local discovery snapshot to nodes whose per-engine inventory
    advertises the requested model. Ollama normalizes the implicit `:latest` tag;
-   LM Studio ids match exactly. An empty owner set returns a local `502` without
+   LM Studio ids and OpenAI-compatible server ids match exactly. A facade also
+   grants its riding engines' models to the same candidate set, so a model
+   served by a node's OpenAI-compatible server is eligible through the Ollama
+   facade. An empty owner set returns a local `502` without
    contacting an engine.
 2. Order the eligible owners: explicit `node/select` pin, then the scheduler's
    priority list, then deterministic default ordering.
@@ -177,6 +188,10 @@ For a model-bearing inference request:
 
 An ineligible manual selection cannot override the capability gate, and failover
 never broadens to an excluded node.
+
+Manual nodes are an exception to the riding grant: their probes report only the
+managed engines' inventories, so a user-managed OpenAI-compatible server on a
+manually added node is never advertised and its models stay unroutable there.
 
 ### 5.1 Retry bounds
 
@@ -368,6 +383,7 @@ These are the statuses the proxy itself returns:
 | Condition | Status |
 | --- | --- |
 | No owner advertises the model, nothing dispatched | `502` |
+| Model is advertised only by a facade-riding engine, but the request path is native to the facade engine (`/api/*` inference) and the route grant excludes the rider | `502` with `engine-dialect-mismatch`, naming the model and the OpenAI inference paths on the same port. Anthropic Messages carries the rider grant and forwards verbatim, so it never takes this row. |
 | Final permitted attempt returned a status | that status and body, unchanged |
 | Final permitted attempt failed at the transport | `502` |
 | Final permitted attempt answered but produced no content | `504` |
@@ -447,6 +463,11 @@ redelivery and dropped by every peer.
 
 A job admitted but not yet dispatched has no execution node. Consumers must
 treat an absent `scheduledOn` as "not placed" rather than assuming a node.
+
+Each event also names the **engine** that will serve (or served) the job. A
+model advertised by both engines of one node resolves to the facade engine —
+the same collision rule the dispatch itself applies — so the workload's engine
+always matches the backend that actually receives the request.
 
 ### 5.6 Coverage gap: non-streaming requests
 
@@ -585,12 +606,18 @@ service key, its ports and persisted-port filename, its route table and model
 normalization, and its empty model-list envelope. It needs no new process, no
 new supervisor, and no new relay wiring.
 
+The riding variant needs less: set `SharedFacade` in the shared engine table,
+give the facade profile the rider's routes and model naming, and skip the
+identity, ports, persisted-port file, and facade enablement entirely — a riding
+engine owns no listener and is never announced under its discovery service key.
+
 ## 11. Failure modes
 
 | Mode | Behavior |
 | --- | --- |
 | Requested port taken at enable | Tagged bind failure; broker retries on a fallback port |
 | No advertised owner for the model | Local `502`, no engine contacted |
+| Rider-only model on a facade-native path | Local `502` `engine-dialect-mismatch` naming the OpenAI inference paths; not an error record, a routing answer |
 | All owners refuse retryably | Last upstream status surfaced |
 | Transport error with candidates left | Forget the node's confirmed address, fail over |
 | Client disconnects mid-stream | Terminal workload event emitted at once; upstream cancelled |

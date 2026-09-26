@@ -20,7 +20,8 @@ export const EngineCapabilities: Record<EngineType, EngineCaps> = {
         hasModelSearchOnlyWhenRunning: true,
         modelOpsWhenStopped: false,
         hasDeleteModel: true,
-        engineHub: { label: 'Ollama', url: 'https://ollama.com/library' }
+        engineHub: { label: 'Ollama', url: 'https://ollama.com/library' },
+        userManaged: false
     },
     'lm-studio': {
         hasExpiry: false,
@@ -42,6 +43,26 @@ export const EngineCapabilities: Record<EngineType, EngineCaps> = {
         // exposes no rescan, so nvpair-engine-manager's delete_model restarts the
         // server. Deleting therefore interrupts inference and needs a warning.
         restartsOnModelDelete: true,
-        engineHub: { label: 'LM Studio', url: 'https://lmstudio.ai/models' }
+        engineHub: { label: 'LM Studio', url: 'https://lmstudio.ai/models' },
+        userManaged: false
+    },
+    'openai-compatible': {
+        hasExpiry: false,
+        // A server PAIR does not own offers no unload path; models come and go
+        // with whatever the user's server has loaded.
+        hasEject: false,
+        hasInstall: [],
+        // The port is the user's server's advisory listen port, not one PAIR
+        // configures a process to use.
+        hasEnginePort: true,
+        hasInstallPath: false,
+        hasProxyWebUI: false,
+        hasPreferredNode: false,
+        // PAIR does not supervise the process, so there is nothing to alert on.
+        hasCrashAlert: false,
+        hasModelSearchOnlyWhenRunning: false,
+        modelOpsWhenStopped: false,
+        hasDeleteModel: false,
+        userManaged: true
     }
 }

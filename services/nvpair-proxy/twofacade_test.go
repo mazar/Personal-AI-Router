@@ -78,21 +78,42 @@ func enableOnFreePort(t *testing.T, p *Proxy, engine string) int {
 	return 0
 }
 
-// twoFacadeProxy enables a facade for every engine on one host, each on its own
-// ephemeral port so the test does not depend on a real engine's port being free.
+// facadeEngines returns the engines that own a facade (SharedFacade unset).
+// Facade-less engines ride another engine's listener and are refused by
+// enableFacade, so every enumeration here must skip them — which is itself the
+// invariant worth asserting: these tests would catch a future engine that
+// claims a facade it does not own.
+func facadeEngines(t *testing.T) []engines.Engine {
+	t.Helper()
+	var out []engines.Engine
+	for _, e := range engines.All() {
+		if e.SharedFacade == "" {
+			out = append(out, e)
+		}
+	}
+	if len(out) < 2 {
+		t.Fatalf("these tests need at least two facade-owning engines, have %d", len(out))
+	}
+	return out
+}
+
+// twoFacadeProxy enables a facade for every facade-owning engine on one host,
+// each on its own ephemeral port so the test does not depend on a real engine's
+// port being free.
 func twoFacadeProxy(t *testing.T) *Proxy {
 	t.Helper()
 	redirectConfigDir(t)
 
+	facades := facadeEngines(t)
 	p := NewProxy(NewCodec(rwNop{}))
 	p.serveCtx = t.Context()
-	for _, e := range engines.All() {
+	for _, e := range facades {
 		enableOnFreePort(t, p, e.Name)
 	}
 	t.Cleanup(func() { p.shutdown(t.Context()) })
 
-	if got := len(p.enabledFacades()); got != len(engines.All()) {
-		t.Fatalf("enabled %d facades, want %d", got, len(engines.All()))
+	if got := len(p.enabledFacades()); got != len(facades) {
+		t.Fatalf("enabled %d facades, want %d", got, len(facades))
 	}
 	return p
 }
@@ -104,7 +125,7 @@ func TestTwoFacadesKeepSeparatePortsAndProfiles(t *testing.T) {
 	p := twoFacadeProxy(t)
 
 	ports := map[int]string{}
-	for _, e := range engines.All() {
+	for _, e := range facadeEngines(t) {
 		f := p.facadeFor(e.Name)
 		if f == nil {
 			t.Fatalf("no facade enabled for %s", e.Name)
@@ -125,7 +146,7 @@ func TestTwoFacadesKeepSeparatePortsAndProfiles(t *testing.T) {
 func TestReEnablingOneFacadeLeavesBothIntact(t *testing.T) {
 	p := twoFacadeProxy(t)
 
-	first := engines.All()[0]
+	first := facadeEngines(t)[0]
 	before := p.facadeFor(first.Name)
 
 	result, err := p.enableFacade(enableFacadeParams{
@@ -141,8 +162,8 @@ func TestReEnablingOneFacadeLeavesBothIntact(t *testing.T) {
 	if p.facadeFor(first.Name) != before {
 		t.Error("re-enable replaced the running facade")
 	}
-	if got := len(p.enabledFacades()); got != len(engines.All()) {
-		t.Errorf("after re-enable there are %d facades, want %d", got, len(engines.All()))
+	if got := len(p.enabledFacades()); got != len(facadeEngines(t)) {
+		t.Errorf("after re-enable there are %d facades, want %d", got, len(facadeEngines(t)))
 	}
 }
 
@@ -152,11 +173,8 @@ func TestReEnablingOneFacadeLeavesBothIntact(t *testing.T) {
 func TestOneFacadeFailingToBindLeavesTheOthersServing(t *testing.T) {
 	redirectConfigDir(t)
 
-	all := engines.All()
-	if len(all) < 2 {
-		t.Skip("needs at least two engines")
-	}
-	surviving, failing := all[0], all[1]
+	facades := facadeEngines(t)
+	surviving, failing := facades[0], facades[1]
 
 	p := NewProxy(NewCodec(rwNop{}))
 	p.serveCtx = t.Context()
@@ -198,8 +216,8 @@ func TestOneFacadeFailingToBindLeavesTheOthersServing(t *testing.T) {
 func TestAddressedRequestReachesOnlyItsOwnFacade(t *testing.T) {
 	p := twoFacadeProxy(t)
 
-	all := engines.All()
-	first, second := all[0], all[1]
+	facades := facadeEngines(t)
+	first, second := facades[0], facades[1]
 
 	// Give each facade a distinct manual node, then confirm nodes/list on one
 	// engine never reports the other's.
@@ -240,8 +258,8 @@ func TestAddressedRequestReachesOnlyItsOwnFacade(t *testing.T) {
 func TestFacadesShareSchedulerStateAndReservations(t *testing.T) {
 	p := twoFacadeProxy(t)
 
-	all := engines.All()
-	first, second := all[0], all[1]
+	facades := facadeEngines(t)
+	first, second := facades[0], facades[1]
 
 	p.SetPrioritySnapshot(schedulerwire.Priority{
 		Generation: 1,
@@ -280,8 +298,8 @@ func TestFacadesShareSchedulerStateAndReservations(t *testing.T) {
 func TestPanicHandlingOneEngineLeavesTheOtherServing(t *testing.T) {
 	p := twoFacadeProxy(t)
 
-	all := engines.All()
-	victim, bystander := all[0], all[1]
+	facades := facadeEngines(t)
+	victim, bystander := facades[0], facades[1]
 
 	// Take the victim facade's discovery out from under its handler.
 	p.facadeFor(victim.Name).discovery = nil
@@ -311,8 +329,8 @@ func TestPanicHandlingOneEngineLeavesTheOtherServing(t *testing.T) {
 	}
 	p.handleMessage(bystanderMsg)
 
-	if got := len(p.enabledFacades()); got != len(all) {
-		t.Errorf("enabled facades = %d after a panic, want %d", got, len(all))
+	if got := len(p.enabledFacades()); got != len(facades) {
+		t.Errorf("enabled facades = %d after a panic, want %d", got, len(facades))
 	}
 }
 
@@ -326,11 +344,8 @@ func TestPanicHandlingOneEngineLeavesTheOtherServing(t *testing.T) {
 func TestPanicDuringEnableWithdrawsOnlyThatFacade(t *testing.T) {
 	redirectConfigDir(t)
 
-	all := engines.All()
-	if len(all) < 2 {
-		t.Skip("needs at least two engines")
-	}
-	surviving, panicking := all[0], all[1]
+	facades := facadeEngines(t)
+	surviving, panicking := facades[0], facades[1]
 
 	p := NewProxy(NewCodec(rwNop{}))
 	p.serveCtx = t.Context()
@@ -392,7 +407,7 @@ func TestEnableFacadeRejectsUnsafeAliasAddresses(t *testing.T) {
 	redirectConfigDir(t)
 
 	var aliasEngine, plainEngine engines.Engine
-	for _, e := range engines.All() {
+	for _, e := range facadeEngines(t) {
 		p, ok := profileFor(e.Name)
 		if !ok {
 			t.Fatalf("no profile for %s", e.Name)
@@ -448,7 +463,7 @@ func TestBothFacadesAddressTheirNotifications(t *testing.T) {
 	p.serveCtx = t.Context()
 	t.Cleanup(func() { p.shutdown(t.Context()) })
 
-	for _, e := range engines.All() {
+	for _, e := range facadeEngines(t) {
 		enableOnFreePort(t, p, e.Name)
 	}
 
@@ -471,7 +486,7 @@ func TestBothFacadesAddressTheirNotifications(t *testing.T) {
 		readyFor[engine] = true
 	}
 
-	for _, e := range engines.All() {
+	for _, e := range facadeEngines(t) {
 		if !readyFor[e.Name] {
 			t.Errorf("no addressed ready notification for %s; saw %v", e.Name, readyFor)
 		}

@@ -79,11 +79,14 @@ export function EngineSettingsSection({
     const applying =
         usePendingActionsStore(state => state.isSettingsPending(nodeId, engineType)) ||
         snapshot?.phase === 'applying'
+    // A user-managed engine reports editable=false (there is no launch to
+    // edit) but its server port is still applied through the port-only flow.
+    const external = snapshot?.external ?? false
     const readOnly =
         !connected ||
         !!entry?.unavailable ||
-        !snapshot?.editable ||
-        snapshot.format !== 'pair-arguments-v1'
+        (!snapshot?.editable && !external) ||
+        snapshot?.format !== 'pair-arguments-v1'
     const locked = readOnly || disabled || applying
 
     useEffect(() => watchEngineSettings(), [])
@@ -220,7 +223,10 @@ export function EngineSettingsSection({
                             'Waiting for this device’s settings. Older devices require an update to support editing.'}
                     </Text>
                 )}
-                {!readOnly && !isLocalNode && (
+                {!applying && !readOnly && external && snapshot?.reason && (
+                    <Text kind="body/regular/sm">{snapshot.reason}</Text>
+                )}
+                {!readOnly && !external && !isLocalNode && (
                     <Text kind="body/regular/sm">
                         Ports and options can be changed from here. Managed CORS origin settings
                         must be changed on the device running the engine.
@@ -249,28 +255,32 @@ export function EngineSettingsSection({
                             onBlur={() => {
                                 if (dirty) void check()
                             }}
-                            disabled={locked}
+                            // A user-managed engine has no facade of its own:
+                            // its proxy port is the shared facade's.
+                            disabled={locked || external}
                             inputMode="numeric"
                         />
                     </FormField>
                 </Flex>
-                <FormField slotLabel="Engine arguments">
-                    <TextArea
-                        size="small"
-                        aria-label="Engine arguments"
-                        placeholder="Engine arguments; optional NAME=value assignments first"
-                        value={draft.launchText}
-                        onValueChange={value => change('launchText', value)}
-                        onBlur={() => {
-                            if (dirty) void check()
-                        }}
-                        resizeable="auto"
-                        rows={4}
-                        maxLength={16384}
-                        disabled={locked}
-                        className="font-mono"
-                    />
-                </FormField>
+                {!external && (
+                    <FormField slotLabel="Engine arguments">
+                        <TextArea
+                            size="small"
+                            aria-label="Engine arguments"
+                            placeholder="Engine arguments; optional NAME=value assignments first"
+                            value={draft.launchText}
+                            onValueChange={value => change('launchText', value)}
+                            onBlur={() => {
+                                if (dirty) void check()
+                            }}
+                            resizeable="auto"
+                            rows={4}
+                            maxLength={16384}
+                            disabled={locked}
+                            className="font-mono"
+                        />
+                    </FormField>
+                )}
                 <Flex gap="2" justify="end">
                     <Button kind="secondary" size="small" disabled={applying} onClick={reloadDraft}>
                         {dirty || stale ? 'Reload saved settings' : 'Refresh'}

@@ -50,7 +50,13 @@ export default function EndpointContent({
                 name: EngineDisplayNames[type],
                 proxyPort: port,
                 url: gatewayEndpointDisplayUrl(port, type),
-                icon: <EngineIcon type={type} />
+                icon: <EngineIcon type={type} />,
+                // A facade-riding engine publishes the facade's port, not a
+                // second endpoint; say so instead of listing a duplicate URL.
+                note:
+                    type === 'openai-compatible'
+                        ? 'Same port as Ollama — the model name selects the server.'
+                        : undefined
             }
         }).filter(v => !!v)
 
@@ -114,6 +120,11 @@ export default function EndpointContent({
                         {endpoint?.url && (
                             <Text kind="body/regular/sm" className="text-subtle-color truncate">
                                 {endpoint?.url}
+                            </Text>
+                        )}
+                        {endpoint?.note && (
+                            <Text kind="body/regular/sm" className="text-subtle-color truncate">
+                                {endpoint.note}
                             </Text>
                         )}
                     </Stack>

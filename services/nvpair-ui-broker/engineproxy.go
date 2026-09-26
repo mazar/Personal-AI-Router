@@ -45,6 +45,13 @@ const (
 	// and has an official stop command for it, so it may be stopped and
 	// repositioned before the proxy starts. LM Studio.
 	managedEngine
+
+	// externalEngine — the engine is user-managed end to end and owns no
+	// facade at all: its SharedFacade names the engine whose listener carries
+	// it, so there is no process to move and no facade port to block on.
+	// Both choreography predicates are false, and the broker never issues a
+	// facade/enable for it. OpenAI-compatible servers.
+	externalEngine
 )
 
 // engineProxyProfile is everything the broker needs to supervise one engine's
@@ -66,7 +73,8 @@ type engineProxyProfile struct {
 // mayMoveRunningEngine reports whether engine-manager can be asked to
 // reposition this engine while it is running. When it cannot, a facade port
 // that is already occupied is a hard block: the broker has no way to tell its
-// own engine from a stranger, and no authority to stop either.
+// own engine from a stranger, and no authority to stop either. An external
+// engine owns no facade, so there is nothing to move in the first place.
 func (p engineProxyProfile) mayMoveRunningEngine() bool {
 	return p.Ownership == managedEngine
 }
@@ -80,6 +88,7 @@ func (p engineProxyProfile) mayMoveRunningEngine() bool {
 // re-checks the facade afterwards, when a still-busy port genuinely means
 // someone else. Applying the adopted rule to a managed engine would block the
 // most common install, where LM Studio is already running on its facade port.
+// An external engine is never planned at all: it has no facade to occupy.
 func (p engineProxyProfile) blocksOnOccupiedFacade() bool {
 	return p.Ownership == adoptedEngine
 }
@@ -167,6 +176,12 @@ func buildEngineProxyProfiles() []engineProxyProfile {
 		// LM Studio is the one engine engine-manager may move while running:
 		// its identified command-mode runtime has an official stop command.
 		"lmstudio": {Ownership: managedEngine, HealthProbePath: "/v1/models"},
+		// The OpenAI-compatible engine is user-managed and facade-less: PAIR
+		// never spawns, moves or stops it, and it owns no listener — the
+		// facade it rides is Ollama's. Its probe path is the generic
+		// OpenAI model list, which vLLM, SGLang and llama.cpp-server all
+		// answer.
+		"openai-compatible": {Ownership: externalEngine, HealthProbePath: "/v1/models"},
 	}
 	out := make([]engineProxyProfile, 0, len(engines.All()))
 	for _, e := range engines.All() {
@@ -176,6 +191,12 @@ func buildEngineProxyProfiles() []engineProxyProfile {
 	}
 	return out
 }
+
+// openAICompatibleProxyProfile is the facade-riding engine's profile. Unlike
+// the two facade-owning profiles it has no state shorthand: an external
+// engine's runtime carries no facade or backend state for the broker to
+// manage, and everything about it is observed, not owned.
+var openAICompatibleProxyProfile = mustEngineProxyProfile("openai-compatible")
 
 // enableFacadeRequest is the broker's facade/enable payload. It mirrors the
 // child's parameter struct; the port and alias addresses travel here rather
@@ -350,6 +371,17 @@ func engineProxyProfileFor(name string) (engineProxyProfile, bool) {
 // is what settles its ownership gate. Skipping the branch entirely would leave
 // the gate closed and strand every engine request behind it.
 func (b *Broker) proxyEnabled(p engineProxyProfile) bool {
+	// A facade-riding engine is fronted exactly when the facade it rides is:
+	// it has no listener of its own to enable, and selecting it without its
+	// facade engine would promise an endpoint nobody hosts. It therefore
+	// never appears in --proxy-engines on its own behalf.
+	if p.SharedFacade != "" {
+		facade, ok := engineProxyProfileFor(p.SharedFacade)
+		if !ok {
+			return false
+		}
+		return b.proxyEnabled(facade)
+	}
 	if b.proxyPath == "" {
 		return false
 	}
@@ -520,6 +552,11 @@ func (b *Broker) setEngineProxySubscribed(p engineProxyProfile, subscribed bool)
 // <engine>-proxy:shutdown is refused: the broker owns the proxy lifecycle, so a
 // client must not be able to kill it out from under us. A missing proxy gets a
 // clear error rather than a silent hang.
+//
+// A facade-riding engine is relayed to the facade it rides: the client's
+// component prefix still comes off the riding engine's name (the client
+// addressed openai-compatible-proxy), but the wire address to the child names
+// the facade engine, which is the listener that actually serves it.
 func (b *Broker) relayToEngineProxy(profile engineProxyProfile, msg *Message) {
 	respondErr := func(code int, format string, args ...any) {
 		if err := b.codec.RespondError(msg.ID, code, fmt.Sprintf(format, args...)); err != nil {
@@ -533,13 +570,23 @@ func (b *Broker) relayToEngineProxy(profile engineProxyProfile, msg *Message) {
 		return
 	}
 
-	p := b.engineProxyHandle(profile)
+	facade := profile
+	if profile.SharedFacade != "" {
+		resolved, ok := engineProxyProfileFor(profile.SharedFacade)
+		if !ok {
+			respondErr(-32000, "%s rides unknown engine %q", profile.ComponentName(), profile.SharedFacade)
+			return
+		}
+		facade = resolved
+	}
+
+	p := b.engineProxyHandle(facade)
 	if p == nil {
 		respondErr(-32000, "%s not available", profile.ComponentName())
 		return
 	}
 
-	result, rpcErr, err := p.Call(context.Background(), profile.addressed(method), msg.Params)
+	result, rpcErr, err := p.Call(context.Background(), facade.addressed(method), msg.Params)
 	switch {
 	case err != nil:
 		respondErr(-32000, "proxy call failed: %v", err)

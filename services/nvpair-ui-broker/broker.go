@@ -161,22 +161,29 @@ type Broker struct {
 	settingsRelayMu      sync.Mutex
 	settingsCancels      map[string]context.CancelFunc
 	activeSettings       map[string]activeSettingsOperation
-	codec                *Codec
-	cancel               context.CancelFunc
-	startedAt            time.Time
-	nodeID               string
-	scannerPath          string
-	nodeInfoPath         string
-	proxyPath            string
-	proxyEngines         []string
-	workloadMgrPath      string
-	errorsPath           string
-	engineMgrPath        string
-	manualNodesPath      string
-	settingsPath         string
-	clusterMgrPath       string
-	schedulerPath        string
-	clusterDir           string
+	// engineModels caches each engine's last known served inventory from
+	// engine-manager's engine:models sweep, for the local-backend payloads the
+	// cluster ingress routes by: the newest non-empty sweep result per engine,
+	// minus engines a successful sweep authoritatively emptied. Guarded by
+	// engineConfigMu: every reader and writer already runs under it (the
+	// advertise reconcile and the settings operation path).
+	engineModels    map[string][]string
+	codec           *Codec
+	cancel          context.CancelFunc
+	startedAt       time.Time
+	nodeID          string
+	scannerPath     string
+	nodeInfoPath    string
+	proxyPath       string
+	proxyEngines    []string
+	workloadMgrPath string
+	errorsPath      string
+	engineMgrPath   string
+	manualNodesPath string
+	settingsPath    string
+	clusterMgrPath  string
+	schedulerPath   string
+	clusterDir      string
 	// Managed-port state is prepared before proxy startup and read by the proxy
 	// supervisor/reader goroutines. Ollama commits its pending backend move after
 	// its proxy reserves :11434; LM Studio moves through engine-manager first,
@@ -899,6 +906,13 @@ func (b *Broker) spawnProxy() (supervisedHandle, error) {
 	var failed []engineProxyProfile
 	for _, profile := range engineProxyProfiles {
 		if !b.proxyEnabled(profile) {
+			continue
+		}
+		if profile.SharedFacade != "" {
+			// A facade-riding engine brings no listener up: the facade it
+			// rides is enabled for the facade engine in this same loop
+			// (proxyEnabled requires it), and the rider keeps the published
+			// handle so its relays and local-backend pushes work.
 			continue
 		}
 		err := b.enableEngineFacade(bringUp, pp, profile, alias)
@@ -2160,6 +2174,14 @@ func (b *Broker) Serve(ctx context.Context) error {
 	for _, profile := range engineProxyProfiles {
 		if b.proxyEnabled(profile) {
 			anyProxyEnabled = true
+			continue
+		}
+		if profile.SharedFacade != "" {
+			// A facade-riding engine is disabled exactly when its facade
+			// engine is, and that engine's entry above already reports the
+			// one story there is to tell: the facade is not being fronted.
+			// The rider owns no facade port and no startup gate, so both the
+			// report and the finish below would be noise about port 0.
 			continue
 		}
 		reason, report := proxyDisabledReason(b.proxyPath)

@@ -28,6 +28,10 @@ function flag(value: JsonValue | undefined): boolean {
     if (typeof value !== 'boolean') throw new Error('Invalid engine settings response.')
     return value
 }
+// Older devices omit `external` (it is omitempty on the wire); absence means false.
+function optionalFlag(value: JsonValue | undefined): boolean {
+    return value === true
+}
 function isSettingsEngine(value: JsonValue | undefined): value is EngineSettingsTarget['engine'] {
     return typeof value === 'string' && engineTypeFromManagerName(value) !== null
 }
@@ -65,6 +69,7 @@ export function parseEngineSettings(value: JsonValue | undefined): EngineSetting
         running: flag(row.running),
         adopted: flag(row.adopted),
         editable: flag(row.editable),
+        external: optionalFlag(row.external),
         reason: text(row.reason),
         // Preserve the target's argument format so incompatible devices stay read-only.
         format: text(row.format),

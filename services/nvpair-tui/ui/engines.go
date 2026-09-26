@@ -35,14 +35,16 @@ type engineStatus struct {
 // It can also pull a model (engine:action{action:"pull_model"}), rendering
 // the live engine:pull-progress feed the way remote pulls already show.
 type enginesView struct {
-	client     *rpc.Client
-	table      table.Model
-	order      []string
-	byName     map[string]engineStatus
-	status     string
-	input      textinput.Model
-	pulling    bool
-	pullEngine string
+	client      *rpc.Client
+	table       table.Model
+	order       []string
+	byName      map[string]engineStatus
+	status      string
+	input       textinput.Model
+	pulling     bool
+	pullEngine  string
+	settingPort bool
+	portEngine  string
 
 	width, height int
 }
@@ -65,6 +67,10 @@ var (
 	engInstallKey   = key.NewBinding(key.WithKeys("i"), key.WithHelp("i", "install"))
 	engUninstallKey = key.NewBinding(key.WithKeys("u"), key.WithHelp("u", "uninstall"))
 	engPullKey      = key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "pull model"))
+	// The one lifecycle control a user-managed engine needs: where its server
+	// listens. PAIR never starts or stops that engine, so telling it the port
+	// is the whole relationship.
+	engSetPortKey = key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "set server port"))
 )
 
 func newEnginesView(client *rpc.Client) *enginesView {
@@ -181,7 +187,7 @@ func (v *enginesView) Update(msg tea.Msg) tea.Cmd {
 	return nil
 }
 
-func (v *enginesView) CapturingInput() bool { return v.pulling }
+func (v *enginesView) CapturingInput() bool { return v.pulling || v.settingPort }
 
 func (v *enginesView) handleKey(msg tea.KeyMsg) tea.Cmd {
 	if v.pulling {
@@ -197,6 +203,19 @@ func (v *enginesView) handleKey(msg tea.KeyMsg) tea.Cmd {
 		v.input, cmd = v.input.Update(msg)
 		return cmd
 	}
+	if v.settingPort {
+		switch msg.String() {
+		case "enter":
+			return v.submitPort()
+		case "esc":
+			v.settingPort = false
+			v.input.Blur()
+			return nil
+		}
+		var cmd tea.Cmd
+		v.input, cmd = v.input.Update(msg)
+		return cmd
+	}
 	if key.Matches(msg, engPullKey) {
 		engine := v.selectedEngine()
 		if engine == "" {
@@ -205,6 +224,19 @@ func (v *enginesView) handleKey(msg tea.KeyMsg) tea.Cmd {
 		v.pullEngine = engine
 		v.pulling = true
 		v.input.SetValue("")
+		v.input.Placeholder = "model name (e.g. llama3.2)"
+		v.input.Focus()
+		return textinput.Blink
+	}
+	if key.Matches(msg, engSetPortKey) {
+		engine := v.selectedEngine()
+		if engine == "" {
+			return nil
+		}
+		v.portEngine = engine
+		v.settingPort = true
+		v.input.SetValue("")
+		v.input.Placeholder = "server port (e.g. 8888)"
 		v.input.Focus()
 		return textinput.Blink
 	}
@@ -247,6 +279,32 @@ func (v *enginesView) submitPull() tea.Cmd {
 			return engineOpMsg{what: "pull " + model, engine: engine, err: err}
 		}
 		return nil
+	})
+}
+
+// portParams builds the engine:set-port input. The broker serves it through
+// the same authoritative settings operation as the desktop editor — for a
+// user-managed engine that persists the server port and re-probes, touching
+// no process.
+func portParams(engine string, port int) map[string]any {
+	return map[string]any{"engine": engine, "port": port}
+}
+
+// submitPort issues engine:set-port for the selected engine. The engine's own
+// state-changed notification carries the result, so the synchronous response
+// is only a receipt.
+func (v *enginesView) submitPort() tea.Cmd {
+	v.settingPort = false
+	v.input.Blur()
+	engine := v.portEngine
+	port, err := strconv.Atoi(strings.TrimSpace(v.input.Value()))
+	if err != nil || port < 1 || port > 65535 {
+		v.status = "port must be a number between 1 and 65535"
+		return nil
+	}
+	v.status = fmt.Sprintf("set server port %s: %d...", engine, port)
+	return call(v.client, "engine:set-port", portParams(engine, port), func(_ *rpc.Message, err error) tea.Msg {
+		return engineOpMsg{what: "set server port", engine: engine, err: err}
 	})
 }
 
@@ -326,6 +384,9 @@ func (v *enginesView) View() string {
 	if v.pulling {
 		out += "\npull model: " + v.input.View()
 	}
+	if v.settingPort {
+		out += "\nset server port for " + v.portEngine + ": " + v.input.View()
+	}
 	if v.status != "" {
 		out += "\n" + footerStyle.Render(v.status)
 	}
@@ -333,7 +394,7 @@ func (v *enginesView) View() string {
 }
 
 func (v *enginesView) Help() []key.Binding {
-	return []key.Binding{engStartKey, engStopKey, engRestartKey, engInstallKey, engUninstallKey, engPullKey}
+	return []key.Binding{engStartKey, engStopKey, engRestartKey, engInstallKey, engUninstallKey, engPullKey, engSetPortKey}
 }
 
 func yesNo(b bool) string {

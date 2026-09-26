@@ -165,8 +165,10 @@ export function ModelManager({ backend, nodeId }: { backend: BackendInfo; nodeId
     )
     const isRunning = useMemo(() => backend.processStatus === 'running', [backend.processStatus])
     const supportsSearch = useMemo(
-        () => !hasModelSearchOnlyWhenRunning || isRunning,
-        [hasModelSearchOnlyWhenRunning, isRunning]
+        // No hub catalog, no add-model affordance: a user-managed engine's
+        // models arrive through its own application, never through PAIR.
+        () => !!caps?.engineHub && (!hasModelSearchOnlyWhenRunning || isRunning),
+        [caps?.engineHub, hasModelSearchOnlyWhenRunning, isRunning]
     )
 
     const handleDownload = useCallback(
