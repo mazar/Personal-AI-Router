@@ -13,12 +13,14 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"nvpair-shared/noderec"
 )
@@ -722,5 +724,97 @@ func TestSubscribedToNodeProjectsRidingEngineInventory(t *testing.T) {
 	}
 	if nodeAdvertisesModel(rider, got, "flat-a") {
 		t.Error("a legacy flat list advertised for the rider")
+	}
+}
+
+// A rider-only model keeps its owner across retry rounds. The retry loop
+// re-resolves candidates after a failed attempt, and that re-resolution must
+// carry the route's engine grant: without it the resolution degrades to the
+// facade engine alone, a rider-only model has no owner under it, and the
+// request sits in the empty-round wait until the deadline instead of retrying
+// the backend that is still advertising and would answer.
+func TestHandleHTTPRetryRoundKeepsTheRiderGrant(t *testing.T) {
+	// Short so the broken build under test fails fast in the empty-round wait
+	// instead of hanging out the default jobDeadline.
+	setForTest(t, &jobDeadline, 500*time.Millisecond)
+
+	var riderHits atomic.Int32
+	flaky := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if riderHits.Add(1) <= 2 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			io.WriteString(w, `{"error":"loading"}`)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, `{"choices":[]}`)
+	}))
+	defer flaky.Close()
+
+	disc := NewDiscovery()
+	disc.SetSubscribed([]Node{{
+		ID:        "self",
+		Addresses: []string{"127.0.0.1"},
+		Port:      11434,
+		ModelsByEngine: map[string][]string{
+			"openai-compatible": {"vllm-model"},
+		},
+	}})
+	f := ollamaFacade(t, disc)
+	riderBackend := nodeFor(t, "rider-backend", flaky.URL)
+	if err := f.setLocalBackend(localBackend{
+		Engine:  "openai-compatible",
+		Host:    riderBackend.Addresses[0],
+		Port:    riderBackend.Port,
+		Healthy: true, Models: []string{"vllm-model"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	f.handlePlain(rec, loopbackRequest(http.MethodPost, "/v1/chat/completions", `{"model":"vllm-model"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after retrying the rider backend: %s", rec.Code, rec.Body.String())
+	}
+	if got := riderHits.Load(); got != 3 {
+		t.Fatalf("rider saw %d dispatches, want 3 (two failures then a success)", got)
+	}
+}
+
+// The self-target expansion joins the same host dedup as the peer path: this
+// node can appear under two discovery records (a manually-added entry plus its
+// relay-discovered record), and expanding each would put the same loopback
+// backends in the candidate list twice — burning the attempt budget on
+// duplicates and double-loading the engines.
+func TestResolveCandidatesSelfTargetDeduplicatesDuplicateRecords(t *testing.T) {
+	record := Node{
+		Addresses: []string{"127.0.0.1"},
+		Port:      11434,
+		ModelsByEngine: map[string][]string{
+			"ollama":            {"qwen3"},
+			"openai-compatible": {"vllm-model", "qwen3"},
+		},
+	}
+	relay := record
+	relay.ID = "self-relay"
+	manual := record
+	manual.ID = "self-manual"
+
+	disc := NewDiscovery()
+	disc.SetSubscribed([]Node{relay, manual})
+	f := ollamaFacade(t, disc)
+	if err := f.setLocalBackend(localBackend{Engine: "ollama", Host: "127.0.0.1", Port: 11435, Healthy: true, Models: []string{"qwen3"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.setLocalBackend(localBackend{Engine: "openai-compatible", Host: "127.0.0.1", Port: 8000, Healthy: true, Models: []string{"vllm-model"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	cands := f.resolveCandidates("vllm-model", ollamaFacadeEngines...)
+	if len(cands) != 1 || cands[0].engine != "openai-compatible" {
+		t.Fatalf("rider-only candidates from duplicate self records = %+v, want the rider backend once", cands)
+	}
+	cands = f.resolveCandidates("qwen3", ollamaFacadeEngines...)
+	if len(cands) != 2 || cands[0].engine != "ollama" || cands[1].engine != "openai-compatible" {
+		t.Fatalf("shared-model candidates from duplicate self records = %+v, want [ollama openai-compatible] once each", cands)
 	}
 }

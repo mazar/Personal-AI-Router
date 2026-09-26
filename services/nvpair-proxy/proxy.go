@@ -1668,7 +1668,12 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			if !waitBeforeRetry(r.Context(), backoffFor(dispatches, time.Until(deadline))) {
 				break
 			}
-			round = f.resolveCandidates(routingModel)
+			// The same engine grant the first round resolved under: re-resolution
+			// without it degrades to the facade engine alone, which would drop the
+			// riding engine's failover leg — and leave a rider-only model with no
+			// owner at all, hanging in the empty-round wait below until the
+			// deadline.
+			round = f.resolveCandidates(routingModel, rt.Engines...)
 			if isInf && model != "" {
 				round = takeHeld(round)
 			}
@@ -2084,6 +2089,15 @@ func (f *facade) resolveCandidates(model string, allowed ...string) []candidate 
 			// and the workload's engine names the engine that will actually
 			// serve. Both engines advertising is the facade-first collision
 			// rule, unchanged.
+			//
+			// This expansion joins the same host dedup as the peer path below:
+			// this node can appear under two IDs (manual entry plus its
+			// relay-discovered record), and expanding each would dispatch to the
+			// same loopback backends twice.
+			if seenHost[u.Host] {
+				return
+			}
+			seenHost[u.Host] = true
 			serve := engines
 			if model != "" {
 				serve = enginesAdvertising(engines, n, model)
