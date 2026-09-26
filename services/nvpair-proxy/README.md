@@ -112,15 +112,19 @@ and the health crash key are matched against each other, so they move together
 | Model naming | untagged means `:latest`, so `llama3` and `llama3:latest` are one model | identifiers compared byte for byte |
 
 The `openai-compatible` engine appears in none of those rows because it owns no
-facade. Its routes (the OpenAI inference set plus `GET /v1/models`), its exact
-model ids, and its inventory attach to the **Ollama facade**: one endpoint
-serves both engines, and the model name picks the server. Two consequences are
-worth knowing:
+facade. Its routes (the OpenAI inference set, `GET /v1/models`, and Anthropic
+Messages), its exact model ids, and its inventory attach to the **Ollama
+facade**: one endpoint serves both engines, and the model name picks the
+server. Two consequences are worth knowing:
 
 - **Dialect restriction.** A rider-only model has no route on an Ollama-native
-  path (`/api/chat`, `/api/generate`, …) or on Anthropic Messages, so such a
-  request is refused with an actionable local `502` (`engine-dialect-mismatch`)
-  pointing at the OpenAI inference paths on the same port. The refusal is
+  path (`/api/chat`, `/api/generate`, …), so such a request is refused with an
+  actionable local `502` (`engine-dialect-mismatch`) pointing at the OpenAI
+  inference paths on the same port. Anthropic Messages (`/v1/messages`) is
+  granted to riders and forwarded verbatim — modern OpenAI-compatible servers
+  (vLLM, llama.cpp, SGLang) serve it themselves — so an Anthropic-dialect
+  client such as Claude Code reaches a rider model through the facade, and a
+  rider without the endpoint passes its own error through. The refusal is
   suppressed when the route grant already includes the rider or the model is
   also advertised by the facade engine.
 - **Collision rule.** When both engines of one node advertise the same model,

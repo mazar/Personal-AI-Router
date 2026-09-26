@@ -24,6 +24,9 @@ import (
 //
 //   - POST /v1/chat/completions with a rider-only model reaches the rider's
 //     stub and never Ollama's.
+//   - POST /v1/messages with a rider-only model is forwarded verbatim to the
+//     rider: Anthropic Messages is granted to riding engines, and a server
+//     that does not implement it passes its own error through.
 //   - POST /api/chat with a facade-only model reaches Ollama's stub.
 //   - GET /api/tags and GET /v1/models merge both engines' inventories, the
 //     rider's OpenAI-shaped records re-shaped under the caller's envelope.
@@ -35,7 +38,7 @@ import (
 // facade/enable plus node/set-local-backend choreography the broker performs.
 
 func TestRidingEngineFacadeCrossProcess(t *testing.T) {
-	var ollamaChats, riderCalls atomic.Int32
+	var ollamaChats, riderCalls, riderMessages atomic.Int32
 
 	ollamaStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -53,8 +56,9 @@ func TestRidingEngineFacadeCrossProcess(t *testing.T) {
 	}))
 	t.Cleanup(ollamaStub.Close)
 
-	// A user-managed OpenAI-compatible server speaks only the OpenAI dialect:
-	// its model list and inference both live under /v1.
+	// A user-managed OpenAI-compatible server speaks the OpenAI dialect — its
+	// model list and inference live under /v1 — and, like modern vLLM builds,
+	// answers Anthropic Messages on /v1/messages as well.
 	riderStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -63,6 +67,9 @@ func TestRidingEngineFacadeCrossProcess(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
 			riderCalls.Add(1)
 			_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"from the rider"}}]}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/messages":
+			riderMessages.Add(1)
+			_, _ = io.WriteString(w, `{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"from the rider"}],"stop_reason":"end_turn"}`)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -125,6 +132,26 @@ func TestRidingEngineFacadeCrossProcess(t *testing.T) {
 		}
 		if got := ollamaChats.Load(); got != 0 {
 			t.Fatalf("ollama chat count = %d, want 0 (the rider-only model must not reach the facade engine)", got)
+		}
+	})
+
+	t.Run("anthropic messages reach the riding backend", func(t *testing.T) {
+		before := riderMessages.Load()
+		resp, err := client.Post(base+"/v1/messages", "application/json",
+			bytes.NewBufferString(`{"model":"vllm-model","max_tokens":1,"messages":[]}`))
+		if err != nil {
+			t.Fatalf("anthropic-model request failed: %v", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("anthropic-model response = %d %s, want the riding backend's answer", resp.StatusCode, body)
+		}
+		if got := riderMessages.Load(); got != before+1 {
+			t.Fatalf("rider message count = %d, want %d", got, before+1)
+		}
+		if got := ollamaChats.Load(); got != 0 {
+			t.Fatalf("ollama chat count = %d, want 0", got)
 		}
 	})
 

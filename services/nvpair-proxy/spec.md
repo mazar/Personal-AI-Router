@@ -383,7 +383,7 @@ These are the statuses the proxy itself returns:
 | Condition | Status |
 | --- | --- |
 | No owner advertises the model, nothing dispatched | `502` |
-| Model is advertised only by a facade-riding engine, but the request path is native to the facade engine (`/api/*` inference or Anthropic Messages) and the route grant excludes the rider | `502` with `engine-dialect-mismatch`, naming the model and the OpenAI inference paths on the same port |
+| Model is advertised only by a facade-riding engine, but the request path is native to the facade engine (`/api/*` inference) and the route grant excludes the rider | `502` with `engine-dialect-mismatch`, naming the model and the OpenAI inference paths on the same port. Anthropic Messages carries the rider grant and forwards verbatim, so it never takes this row. |
 | Final permitted attempt returned a status | that status and body, unchanged |
 | Final permitted attempt failed at the transport | `502` |
 | Final permitted attempt answered but produced no content | `504` |

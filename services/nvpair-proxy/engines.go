@@ -82,8 +82,8 @@ type route struct {
 	Role routeRole
 	// Engines names the engines allowed to serve this path, facade engine
 	// first. Nil means the facade engine alone: every route on a facade
-	// without riding engines, and on Ollama's facade the native and Anthropic
-	// dialects its riders do not speak.
+	// without riding engines, and on Ollama's facade the native dialect its
+	// riders do not speak.
 	Engines []string
 }
 
@@ -184,12 +184,15 @@ func buildProfiles() []engineProfile {
 	}
 	// The Ollama facade serves two engines: its own, and the user-managed
 	// OpenAI-compatible server riding it. Its OpenAI-dialect inference routes
-	// are granted to both; the native and Anthropic routes stay Ollama's
-	// alone, because the rider speaks neither.
+	// and Anthropic Messages are granted to both: a modern OpenAI-compatible
+	// server (vLLM, llama.cpp, SGLang) serves Anthropic Messages as well, and
+	// the request is forwarded verbatim, so a rider that does not implement it
+	// passes its own error through. The native routes stay Ollama's alone,
+	// because the rider speaks none of them.
 	ollamaRoutes := slices.Concat(
 		ollamaBaseRoutes,
 		routesServedBy(openAIInferenceRoutes, ollamaFacadeEngines),
-		anthropicInferenceRoutes,
+		routesServedBy(anthropicInferenceRoutes, ollamaFacadeEngines),
 	)
 	lmStudioRoutes := slices.Concat(lmStudioBaseRoutes, openAIInferenceRoutes, anthropicInferenceRoutes)
 

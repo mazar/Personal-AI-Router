@@ -290,6 +290,18 @@ func TestHandlePlainNativePathRejectsRiderOnlyModelActionably(t *testing.T) {
 	if strings.Contains(rec3.Body.String(), "engine-dialect-mismatch") {
 		t.Errorf("a granted rider must not be reported as a dialect mismatch: %q", rec3.Body.String())
 	}
+
+	// Anthropic Messages carries the rider grant too — the path reaches the
+	// rider — so a rider-only model there is an availability problem, never a
+	// dialect one.
+	rec4 := httptest.NewRecorder()
+	f.handlePlain(rec4, loopbackRequest(http.MethodPost, "/v1/messages", `{"model":"vllm-model","max_tokens":1}`))
+	if rec4.Code != http.StatusBadGateway {
+		t.Fatalf("anthropic-path rider model without backend status = %d, want %d", rec4.Code, http.StatusBadGateway)
+	}
+	if strings.Contains(rec4.Body.String(), "engine-dialect-mismatch") {
+		t.Errorf("the Anthropic path reaches the rider; it must not report a dialect mismatch: %q", rec4.Body.String())
+	}
 }
 
 // mustProfile resolves an engine profile, failing with a message instead of
@@ -303,14 +315,15 @@ func mustProfile(t *testing.T, name string) engineProfile {
 	return p
 }
 
-// OpenAI-dialect inference on the shared facade port reaches the riding
-// engine's loopback server when that engine advertises the model — and the
-// native path still refuses it even while the backend is healthy, because the
-// dialect, not availability, is what gates the native path.
+// OpenAI-dialect and Anthropic Messages inference on the shared facade port
+// reach the riding engine's loopback server when that engine advertises the
+// model — and the native path still refuses it even while the backend is
+// healthy, because the dialect, not availability, is what gates the native
+// path.
 func TestHandlePlainOpenAIInferenceReachesRidingBackend(t *testing.T) {
 	var riderHits atomic.Int32
 	rider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/chat/completions" {
+		if r.URL.Path != "/v1/chat/completions" && r.URL.Path != "/v1/messages" {
 			t.Errorf("rider received %s %s", r.Method, r.URL.Path)
 			http.NotFound(w, r)
 			return
@@ -358,14 +371,26 @@ func TestHandlePlainOpenAIInferenceReachesRidingBackend(t *testing.T) {
 		t.Fatalf("rider received %d inference calls, want 1", got)
 	}
 
+	// Anthropic Messages forwards verbatim to the rider on the shared grant:
+	// this is the path an Anthropic-dialect client (Claude Code) calls, and a
+	// modern OpenAI-compatible server answers it itself.
+	rec = httptest.NewRecorder()
+	f.handlePlain(rec, loopbackRequest(http.MethodPost, "/v1/messages", `{"model":"vllm-model","max_tokens":1}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("anthropic inference status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := riderHits.Load(); got != 2 {
+		t.Fatalf("rider received %d inference calls, want 2", got)
+	}
+
 	// The native path refuses the same model while the backend is healthy.
 	rec = httptest.NewRecorder()
 	f.handlePlain(rec, loopbackRequest(http.MethodPost, "/api/chat", `{"model":"vllm-model"}`))
 	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "engine-dialect-mismatch") {
 		t.Fatalf("native path with healthy rider = %d %q, want the dialect-mismatch refusal", rec.Code, rec.Body.String())
 	}
-	if got := riderHits.Load(); got != 1 {
-		t.Fatalf("refused native path reached the rider %d times, want 0 more", got-1)
+	if got := riderHits.Load(); got != 2 {
+		t.Fatalf("refused native path reached the rider %d times, want 0 more", got-2)
 	}
 }
 
