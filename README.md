@@ -38,7 +38,7 @@ one, and both report live GPU and memory use throughout.
 | **Architectures** | x64 and arm64 on all three. Windows on ARM is experimental. |
 | **Installers** | Windows `.exe`; Linux `.deb`; macOS `.dmg`. On other Linux distributions, [build from source](docs/building.mdx). |
 | **Mixing nodes** | Windows, Linux, and macOS nodes can all be paired with each other |
-| **Inference engines** | Ollama and LM Studio |
+| **Inference engines** | Ollama, LM Studio, and OpenAI-compatible servers you run yourself (see [About this fork](#about-this-fork)) |
 
 **PAIR running on a machine does not mean an engine will.** PAIR itself runs on
 any supported Windows, Linux, or macOS machine. Each engine sets its own requirements
@@ -48,6 +48,42 @@ between that engine and that machine, so check the engine's own documentation
 before assuming a node can serve a model. A node only becomes a candidate for a
 request once it is actually running a compatible engine, and PAIR prefers the
 nodes it already knows hold the model.
+
+## About this fork
+
+This fork adds a third engine: an **OpenAI-compatible server that you run
+yourself**, such as vLLM (llama.cpp's server and SGLang work too). PAIR never
+installs, starts, or stops it — you run and configure the server in its own
+application, and PAIR probes the port you name in **Engine settings** (default
+8000), adopts it once it answers, and reports it like any other engine. Its
+models ride the Ollama facade, so **one endpoint — the Ollama port, 11434 —
+serves both engines, and the model name picks the server**: OpenAI-shaped and
+Anthropic Messages (Claude Code) requests with a vLLM model reach your server,
+while Ollama's native `/api/*` paths stay Ollama's and refuse a vLLM-only model
+with a pointer to the OpenAI paths on the same port. Routing is cluster-wide,
+so a paired node serves the same requests over mTLS. In the terminal
+interface's **Engines** tab, `e` sets the server port — the one control a
+user-managed engine needs.
+
+**Build and install from source** (Linux; the same checkout also builds the
+Windows and macOS packages):
+
+```bash
+cd desktop
+npm install
+npm run build:linux:arm64            # or build:linux:x64
+sudo dpkg -i release/*/linux/NVPAIR-Setup-*.deb
+```
+
+The package name is unchanged (`nvpair`), so this upgrades a released install
+in place and keeps your data — pairing, ports, and settings. Launch PAIR from
+the applications menu. To work on the app itself rather than package it, use
+`npm start`; on Linux, first give Electron's extracted sandbox helper its
+setuid bit (`sudo chown root:root node_modules/electron/dist/chrome-sandbox &&
+sudo chmod 4755 node_modules/electron/dist/chrome-sandbox`). On a machine with
+no desktop, `cd services && ./build.sh` builds the service binaries — including
+`nvpair-tui` — into `services/build/bin/`. Full prerequisites and per-platform
+detail: [Building and running PAIR from source](docs/building.mdx).
 
 ## Quick start
 
