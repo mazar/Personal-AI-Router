@@ -252,10 +252,14 @@ func (b *Broker) setProxyLocalBackend(p *proxyProcess, engine string, port int, 
 }
 
 // refreshEngineModelsLocked polls engine-manager's engine:models sweep and
-// caches each engine's served inventory. Only non-empty inventories are
-// stored, so a sweep that fails or races an engine restart never blanks what
-// the local backend payloads carry — the Healthy flag is what retires a
-// backend, not a stale model list. Caller holds engineConfigMu.
+// caches each engine's served inventory. Non-empty inventories are stored; a
+// successful sweep that names an engine with an empty inventory is
+// authoritative ("running, serving no models") and evicts that engine's cache,
+// so a model the user deleted stops being routed here. An engine the sweep
+// could not query is absent from the result entirely and keeps its cached list
+// — a failed or racing sweep never blanks what the local backend payloads
+// carry; the Healthy flag is what retires a backend. Caller holds
+// engineConfigMu.
 func (b *Broker) refreshEngineModelsLocked() {
 	em := b.getEngineMgr()
 	if em == nil {
@@ -271,6 +275,7 @@ func (b *Broker) refreshEngineModelsLocked() {
 	}
 	for engine, models := range result.ByEngine {
 		if len(models) == 0 {
+			delete(b.engineModels, engine)
 			continue
 		}
 		if b.engineModels == nil {

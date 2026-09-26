@@ -161,11 +161,12 @@ type Broker struct {
 	settingsRelayMu      sync.Mutex
 	settingsCancels      map[string]context.CancelFunc
 	activeSettings       map[string]activeSettingsOperation
-	// engineModels caches the last non-empty per-engine served inventory from
+	// engineModels caches each engine's last known served inventory from
 	// engine-manager's engine:models sweep, for the local-backend payloads the
-	// cluster ingress routes by. Guarded by engineConfigMu: every reader and
-	// writer already runs under it (the advertise reconcile and the settings
-	// operation path).
+	// cluster ingress routes by: the newest non-empty sweep result per engine,
+	// minus engines a successful sweep authoritatively emptied. Guarded by
+	// engineConfigMu: every reader and writer already runs under it (the
+	// advertise reconcile and the settings operation path).
 	engineModels    map[string][]string
 	codec           *Codec
 	cancel          context.CancelFunc
